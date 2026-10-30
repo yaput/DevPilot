@@ -19,18 +19,20 @@ struct ClaudeCodeRunnerTests {
     }
 
     func runner(_ fake: FakeClaude, timeout: Duration = .seconds(20)) -> ClaudeCodeRunner {
-        ClaudeCodeRunner(executable: fake.executable, model: "haiku", timeout: timeout)
+        ClaudeCodeRunner(executable: fake.executable, model: "haiku", investigationTimeout: timeout, implementationTimeout: timeout)
     }
 
     @Test func argumentsAreReadOnlyAndIgnoreRepositorySettings() {
-        let arguments = ClaudeCodeRunner(executable: URL(filePath: "/bin/claude"), model: nil, timeout: .seconds(1)).investigationArguments()
+        let arguments = ClaudeCodeRunner(
+            executable: URL(filePath: "/bin/claude"), model: nil, investigationTimeout: .seconds(1), implementationTimeout: .seconds(1)
+        ).investigationArguments(worktree: "/w/t")
         func value(after flag: String) -> String? {
             arguments.firstIndex(of: flag).map { arguments[$0 + 1] }
         }
         #expect(value(after: "--tools") == "Read,Grep,Glob")
-        #expect(value(after: "--allowedTools") == "Read,Grep,Glob")
+        #expect(value(after: "--allowedTools") == "Read(//w/t/**)")
         #expect(value(after: "--permission-mode") == "dontAsk")
-        #expect(value(after: "--setting-sources") == "user")
+        #expect(value(after: "--setting-sources") == "")
         #expect(arguments.contains("--strict-mcp-config"))
         #expect(arguments.contains("--no-session-persistence"))
         #expect(!arguments.contains("--model"))

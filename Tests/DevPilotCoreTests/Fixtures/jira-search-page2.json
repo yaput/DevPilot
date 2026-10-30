@@ -5,6 +5,7 @@
       "key": "MOB-77",
       "fields": {
         "summary": "Crash when opening order details offline",
+        "issuetype": { "name": "Bug" },
         "status": { "name": "In Progress" },
         "assignee": { "displayName": "Jane Doe" },
         "description": null,

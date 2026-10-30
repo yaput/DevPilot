@@ -1,42 +1,141 @@
+import Darwin
 import Foundation
 import Synchronization
 
 /// Drives the Claude Code CLI in headless mode.
 ///
-/// Read-only enforcement does not rely on the prompt: only Read/Grep/Glob are available
-/// (`--tools`), anything else is denied without asking (`--permission-mode dontAsk`), repository
-/// settings, hooks and MCP servers are ignored (`--setting-sources user`, `--strict-mcp-config`),
-/// and the process gets a minimal environment without API keys or SSH agent.
+/// Enforcement does not rely on the prompt:
+/// - only the tools a mode needs exist (`--tools`), and anything not explicitly allowed is denied
+///   without asking (`--permission-mode dontAsk`);
+/// - reads, and in implementation edits, are allowed only inside the worktree (`Read(//…/**)`,
+///   `Edit(//…/**)`, which also cover Grep, Glob and Write);
+/// - no settings, hooks or MCP servers are loaded from the user or the repository
+///   (`--setting-sources ""`, `--strict-mcp-config`);
+/// - implementation shell commands run in Claude Code's sandbox (`SandboxPolicy`) and only
+///   match the repository's approved prefixes;
+/// - the process gets a minimal environment without API keys, SSH agent or cloud credentials.
 public struct ClaudeCodeRunner: AgentRunner {
-    static let readOnlyTools = ["Read", "Grep", "Glob"]
-
     private let executable: URL
     private let model: String?
-    private let timeout: Duration
+    private let investigationTimeout: Duration
+    private let implementationTimeout: Duration
 
-    public init(executable: URL, model: String?, timeout: Duration) {
+    public init(executable: URL, model: String?, investigationTimeout: Duration, implementationTimeout: Duration) {
         self.executable = executable
         self.model = model?.trimmingCharacters(in: .whitespaces).isEmpty == false ? model : nil
-        self.timeout = timeout
+        self.investigationTimeout = investigationTimeout
+        self.implementationTimeout = implementationTimeout
     }
+
+    // MARK: - Investigation
 
     public func investigate(
         _ request: InvestigationRequest,
         onProgress: @escaping @Sendable (String) -> Void
     ) async throws -> (Investigation, AgentRunStats) {
-        let prompt = InvestigationPrompt.render(request)
-        let log = try TranscriptLog(url: request.logURL, prompt: prompt)
-        let finalEvent = Mutex<JSONValue?>(nil)
-        let worktree = request.workspace.worktreePath
+        try await run(
+            arguments: investigationArguments(worktree: request.workspace.worktreePath),
+            prompt: InvestigationPrompt.render(request),
+            worktree: request.workspace.worktreePath,
+            environment: Self.environment(),
+            timeout: investigationTimeout,
+            logURL: request.logURL,
+            onLaunch: request.onLaunch,
+            onProgress: onProgress
+        )
+    }
 
+    func investigationArguments(worktree: String) -> [String] {
+        common(schema: InvestigationPrompt.schema, policy: InvestigationPrompt.policy) + [
+            "--tools", "Read,Grep,Glob",
+            "--allowedTools", Self.within("Read", worktree),
+        ]
+    }
+
+    // MARK: - Implementation
+
+    public func implement(
+        _ request: ImplementationRequest,
+        onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> (ImplementationReport, AgentRunStats) {
+        try await run(
+            arguments: implementationArguments(request),
+            prompt: ImplementationPrompt.render(request),
+            worktree: request.workspace.worktreePath,
+            environment: request.tools.variables(base: Self.environment()),
+            timeout: implementationTimeout,
+            logURL: request.logURL,
+            onLaunch: request.onLaunch,
+            onProgress: onProgress
+        )
+    }
+
+    func implementationArguments(_ request: ImplementationRequest) -> [String] {
+        let worktree = request.workspace.worktreePath
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        let allowed = [Self.within("Read", worktree), Self.within("Edit", worktree)]
+            + request.allowedCommands.map { "Bash(\($0):*)" }
+        let denied = ["Edit(/\(worktree)/.git)"] + CommandPresets.alwaysDenied.map { "Bash(\($0):*)" }
+        let tools = request.allowedCommands.isEmpty ? "Read,Grep,Glob,Edit,Write" : "Read,Grep,Glob,Edit,Write,Bash"
+        // Sandbox rules match real paths, so symlinks (e.g. /var → /private/var) are resolved first.
+        let sandbox = SandboxPolicy.settingsJSON(
+            worktree: GitWorktreeManager.realPath(worktree),
+            commonGitDirectory: GitWorktreeManager.realPath(request.commonGitDirectory),
+            home: home
+        )
+        // Each rule is its own argument: rules such as `Bash(git status:*)` contain spaces.
+        return common(schema: ImplementationPrompt.schema, policy: ImplementationPrompt.policy)
+            + ["--tools", tools]
+            + ["--allowedTools"] + allowed
+            + ["--disallowedTools"] + denied
+            + ["--settings", sandbox]
+    }
+
+    // MARK: - Shared
+
+    private func common(schema: String, policy: String) -> [String] {
+        var arguments = [
+            "-p",
+            "--output-format", "stream-json", "--verbose",
+            "--json-schema", schema,
+            "--permission-mode", "dontAsk",
+            "--setting-sources", "",
+            "--strict-mcp-config", "--mcp-config", #"{"mcpServers":{}}"#,
+            "--no-session-persistence",
+            "--append-system-prompt", policy,
+        ]
+        if let model {
+            arguments += ["--model", model]
+        }
+        return arguments
+    }
+
+    /// `Read(//abs/path/**)`: a leading `//` makes the pattern an absolute path.
+    static func within(_ tool: String, _ directory: String) -> String {
+        "\(tool)(/\(directory)/**)"
+    }
+
+    private func run<Output: Decodable>(
+        arguments: [String],
+        prompt: String,
+        worktree: String,
+        environment: [String: String],
+        timeout: Duration,
+        logURL: URL,
+        onLaunch: (@Sendable (pid_t) -> Void)?,
+        onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> (Output, AgentRunStats) {
+        let log = try TranscriptLog(url: logURL, prompt: prompt)
+        let finalEvent = Mutex<JSONValue?>(nil)
         let result = try await ProcessRunner.run(
             ProcessRequest(
                 executable: executable,
-                arguments: investigationArguments(),
+                arguments: arguments,
                 workingDirectory: URL(filePath: worktree, directoryHint: .isDirectory),
-                environment: Self.environment(),
+                environment: environment,
                 stdin: Data(prompt.utf8),
-                timeout: timeout
+                timeout: timeout,
+                onLaunch: onLaunch
             )
         ) { line in
             log.append(line)
@@ -56,31 +155,12 @@ public struct ClaudeCodeRunner: AgentRunner {
         return try Self.parseResult(finalEvent.withLock { $0 }, process: result)
     }
 
-    func investigationArguments() -> [String] {
-        var arguments = [
-            "-p",
-            "--output-format", "stream-json", "--verbose",
-            "--json-schema", InvestigationPrompt.schema,
-            "--tools", Self.readOnlyTools.joined(separator: ","),
-            "--allowedTools", Self.readOnlyTools.joined(separator: ","),
-            "--permission-mode", "dontAsk",
-            "--setting-sources", "user",
-            "--strict-mcp-config", "--mcp-config", #"{"mcpServers":{}}"#,
-            "--no-session-persistence",
-            "--append-system-prompt", InvestigationPrompt.policy,
-        ]
-        if let model {
-            arguments += ["--model", model]
-        }
-        return arguments
-    }
-
     /// Only what Claude Code needs to find its login. `ANTHROPIC_API_KEY` is deliberately
     /// absent so the stored claude.ai login is used, as are SSH and cloud credentials.
     static func environment() -> [String: String] {
         let inherited = ProcessInfo.processInfo.environment
         var environment = [
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "PATH": ToolEnvironment.systemPath,
             "LANG": "en_US.UTF-8",
             "TERM": "dumb",
             "DISABLE_AUTOUPDATER": "1",
@@ -92,7 +172,7 @@ public struct ClaudeCodeRunner: AgentRunner {
         return environment
     }
 
-    static func parseResult(_ event: JSONValue?, process: ProcessResult) throws -> (Investigation, AgentRunStats) {
+    static func parseResult<Output: Decodable>(_ event: JSONValue?, process: ProcessResult) throws -> (Output, AgentRunStats) {
         guard let event else {
             let detail = process.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
             let message = detail.isEmpty ? "Claude Code exited (\(process.termination)) without a result." : String(detail.suffix(500))
@@ -106,9 +186,9 @@ public struct ClaudeCodeRunner: AgentRunner {
         guard let structured = event["structured_output"], case .object = structured else {
             throw AgentError.invalidOutput("No structured output in the result.")
         }
-        let investigation: Investigation
+        let output: Output
         do {
-            investigation = try JSONDecoder().decode(Investigation.self, from: JSONEncoder().encode(structured))
+            output = try JSONDecoder().decode(Output.self, from: JSONEncoder().encode(structured))
         } catch {
             throw AgentError.invalidOutput("\(error)")
         }
@@ -116,7 +196,7 @@ public struct ClaudeCodeRunner: AgentRunner {
             numTurns: event["num_turns"]?.number.map { Int($0) },
             costUSD: event["total_cost_usd"]?.number
         )
-        return (investigation, stats)
+        return (output, stats)
     }
 
     private static func looksLikeLoginProblem(_ message: String) -> Bool {
@@ -144,7 +224,12 @@ public struct ClaudeCodeRunner: AgentRunner {
                     let scope = input?["path"]?.string.map { " in \(relative($0))" } ?? ""
                     return "Searching for “\(input?["pattern"]?.string ?? "")”\(scope)"
                 case "Glob": return "Listing \(input?["pattern"]?.string ?? "files")"
-                case "StructuredOutput": return "Writing the decision record"
+                case "Edit", "MultiEdit": return "Editing \(relative(input?["file_path"]?.string))"
+                case "Write": return "Writing \(relative(input?["file_path"]?.string))"
+                case "Bash":
+                    let command = (input?["command"]?.string ?? "").replacingOccurrences(of: "\n", with: " ")
+                    return "Running `\(command.count > 100 ? command.prefix(100) + "…" : command)`"
+                case "StructuredOutput": return "Writing the report"
                 case let name?: return "Using \(name)"
                 case nil: return nil
                 }

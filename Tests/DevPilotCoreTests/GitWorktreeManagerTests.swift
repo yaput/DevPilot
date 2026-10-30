@@ -38,13 +38,13 @@ struct GitWorktreeManagerTests {
 
         let workspace = try await repo.manager.prepareWorktree(for: ticket("PLAT-182"), repository: repo.config)
 
-        #expect(workspace.branch == "devpilot/jira-plat-182")
+        #expect(workspace.branch == "feat/PLAT-182")
         #expect(workspace.worktreePath == repo.worktrees.appending(path: "test-repo/jira-plat-182").path)
         #expect(FileManager.default.fileExists(atPath: URL(filePath: workspace.worktreePath).appending(path: "README.md").path))
         let head = try await repo.git("rev-parse", "HEAD")
         #expect(workspace.baseCommit == head)
         let branch = try await repo.git("branch", "--show-current", in: URL(filePath: workspace.worktreePath))
-        #expect(branch == "devpilot/jira-plat-182")
+        #expect(branch == "feat/PLAT-182")
         // The main checkout is untouched.
         #expect(try await repo.git("branch", "--show-current") == "main")
     }
@@ -54,8 +54,8 @@ struct GitWorktreeManagerTests {
         defer { repo.remove() }
         let first = try await repo.manager.prepareWorktree(for: ticket("PLAT-1"), repository: repo.config)
         let second = try await repo.manager.prepareWorktree(for: ticket("PLAT-1", source: "other.atlassian.net"), repository: repo.config)
-        #expect(first.branch == "devpilot/jira-plat-1")
-        #expect(second.branch == "devpilot/jira-plat-1-2")
+        #expect(first.branch == "feat/PLAT-1")
+        #expect(second.branch == "feat/PLAT-1-2")
         #expect(first.worktreePath != second.worktreePath)
     }
 
@@ -63,7 +63,7 @@ struct GitWorktreeManagerTests {
         let repo = try await TestRepository()
         defer { repo.remove() }
         let workspace = try await repo.manager.prepareWorktree(for: ticket("../../etc/passwd -rf"), repository: repo.config)
-        #expect(workspace.branch == "devpilot/jira-etc-passwd-rf")
+        #expect(workspace.branch == "feat/etc-passwd-rf")
         #expect(workspace.worktreePath.hasPrefix(repo.worktrees.path))
     }
 
@@ -103,5 +103,46 @@ struct GitWorktreeManagerTests {
     ])
     func slugs(input: String, expected: String) {
         #expect(GitWorktreeManager.slug(input, maxLength: 50) == expected)
+    }
+}
+
+struct BaseBranchTests {
+    @Test func listsBranchesNewestFirstWithoutHEAD() async throws {
+        let repo = try await TestRepository()
+        defer { repo.remove() }
+        try await repo.git("branch", "old-release")
+        try await repo.git("checkout", "-q", "-b", "develop")
+        try "newer\n".write(to: repo.repo.appending(path: "new.txt"), atomically: true, encoding: .utf8)
+        try await repo.git("add", "-A")
+        try await repo.git("-c", "user.email=a@b", "-c", "user.name=u", "-c", "commit.gpgsign=false",
+                           "commit", "-qm", "newer", "--date=2099-01-01T00:00:00")
+        try await repo.git("update-ref", "refs/remotes/origin/develop", "develop")
+        try await repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop")
+
+        let branches = try await repo.manager.branches(inRepositoryAt: repo.repo.path)
+
+        #expect(Set(branches.map(\.name)) == ["develop", "origin/develop", "main", "old-release"])
+        #expect(branches.first { $0.name == "origin/develop" }?.isRemote == true)
+        #expect(branches.first { $0.name == "develop" }?.isRemote == false)
+        let develop = try #require(branches.firstIndex { $0.name == "develop" })
+        let main = try #require(branches.firstIndex { $0.name == "main" })
+        #expect(branches[develop].lastCommitDate >= branches[main].lastCommitDate)
+    }
+
+    @Test func perTicketBaseOverridesRepositorySetting() async throws {
+        let repo = try await TestRepository()
+        defer { repo.remove() }
+        try await repo.git("checkout", "-q", "-b", "develop")
+        try "dev only\n".write(to: repo.repo.appending(path: "dev.txt"), atomically: true, encoding: .utf8)
+        try await repo.git("add", "-A")
+        try await repo.git("-c", "user.email=a@b", "-c", "user.name=u", "commit", "-qm", "dev")
+        let developHead = try await repo.git("rev-parse", "develop")
+
+        let workspace = try await repo.manager.prepareWorktree(for: .sample(), repository: repo.config, baseBranch: "develop")
+
+        #expect(repo.config.baseBranch == "main")
+        #expect(workspace.baseBranch == "develop")
+        #expect(workspace.baseCommit == developHead)
+        #expect(FileManager.default.fileExists(atPath: URL(filePath: workspace.worktreePath).appending(path: "dev.txt").path))
     }
 }

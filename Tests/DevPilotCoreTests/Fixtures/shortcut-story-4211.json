@@ -1,5 +1,6 @@
 {
   "id": 4211,
+  "story_type": "feature",
   "name": "Add retry with backoff to webhook delivery",
   "description": "Webhook deliveries fail permanently on the first 5xx.\n\n**Acceptance Criteria:**\n- [ ] Retries on 5xx and timeouts, not on 4xx\n- [ ] Backoff capped at 10 minutes total\n\n## Notes\nSee runbook.",
   "app_url": "https://app.shortcut.com/acme/story/4211",

@@ -28,7 +28,7 @@ public struct JiraTicketProvider: TicketProvider {
     private var source: String { siteURL.host() ?? siteURL.absoluteString }
 
     private var fields: [String] {
-        ["summary", "description", "status", "assignee", "comment"] + [acceptanceCriteriaField].compactMap { $0 }
+        ["summary", "description", "status", "assignee", "comment", "issuetype"] + [acceptanceCriteriaField].compactMap { $0 }
     }
 
     public func checkConnection() async throws -> String {
@@ -91,7 +91,8 @@ public struct JiraTicketProvider: TicketProvider {
             url: siteURL.appending(path: "browse/\(issue.key)"),
             comments: comments,
             acceptanceCriteria: criteria,
-            fetchedAt: fetchedAt
+            fetchedAt: fetchedAt,
+            type: TicketType(providerName: fields["issuetype"]?["name"]?.string ?? "")
         )
     }
 

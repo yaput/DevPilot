@@ -14,6 +14,33 @@ public enum TicketProviderKind: String, Codable, Sendable, CaseIterable, Compara
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 }
 
+/// What kind of work a ticket is. Drives the branch prefix (`feat/`, `fix/`, `chore/`).
+public enum TicketType: String, Codable, Sendable, CaseIterable {
+    case feature
+    case bug
+    case chore
+
+    /// Shortcut `story_type` values map directly; Jira issue type names are classified.
+    public init(providerName: String) {
+        let name = providerName.lowercased().trimmingCharacters(in: .whitespaces)
+        if name.contains("bug") || name.contains("defect") || name.contains("incident") {
+            self = .bug
+        } else if ["chore", "task", "sub-task", "subtask", "maintenance", "technical debt", "tech debt"].contains(name) {
+            self = .chore
+        } else {
+            self = .feature
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .feature: "Feature"
+        case .bug: "Bug"
+        case .chore: "Chore"
+        }
+    }
+}
+
 public struct TicketComment: Codable, Sendable, Hashable {
     public let author: String
     public let body: String
@@ -45,6 +72,7 @@ public struct Ticket: Identifiable, Codable, Sendable, Hashable {
     public let comments: [TicketComment]
     public let acceptanceCriteria: [String]
     public let fetchedAt: Date
+    public let type: TicketType
 
     public var id: String { Self.makeID(provider: provider, source: source, externalID: externalID) }
 
@@ -63,7 +91,8 @@ public struct Ticket: Identifiable, Codable, Sendable, Hashable {
         url: URL,
         comments: [TicketComment],
         acceptanceCriteria: [String],
-        fetchedAt: Date
+        fetchedAt: Date,
+        type: TicketType = .feature
     ) {
         self.provider = provider
         self.source = source
@@ -76,5 +105,6 @@ public struct Ticket: Identifiable, Codable, Sendable, Hashable {
         self.comments = comments
         self.acceptanceCriteria = acceptanceCriteria
         self.fetchedAt = fetchedAt
+        self.type = type
     }
 }

@@ -31,8 +31,10 @@ struct WorkflowStateTests {
 
     @Test func onlyApprovalDecisionsLeaveAwaitingApproval() {
         #expect(WorkflowState.awaitingPlanApproval.allowedNextStates == [.approved, .needsRevision, .rejected, .cancelled])
+        // Besides an approval decision, only a failed/stopped implementation may return to
+        // `approved`, and the database re-checks the approval when it does.
         let entriesToApproved = WorkflowState.allCases.filter { $0.canTransition(to: .approved) }
-        #expect(entriesToApproved == [.awaitingPlanApproval])
+        #expect(Set(entriesToApproved) == [.awaitingPlanApproval, .failed, .cancelled])
     }
 
     @Test func completeIsTerminal() {

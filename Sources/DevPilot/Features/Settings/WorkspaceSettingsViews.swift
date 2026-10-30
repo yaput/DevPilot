@@ -8,9 +8,13 @@ struct RepositoriesSettingsView: View {
     @State private var draft = WorkspaceSettings()
     @State private var error: String?
     @State private var isAdding = false
+    @State private var configuringID: String?
 
     var body: some View {
         Form {
+            if model.hasActiveRuns {
+                RunningAgentBanner()
+            }
             Section {
                 if draft.repositories.isEmpty {
                     Text("No repositories yet.").foregroundStyle(.secondary)
@@ -24,7 +28,16 @@ struct RepositoriesSettingsView: View {
                                 .help("Remove repository (existing worktrees are kept)")
                         }
                         Text(repository.path).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
-                        TextField("Base branch", text: $repository.baseBranch, prompt: Text("main"))
+                        BaseBranchField(title: "Base branch", branch: $repository.baseBranch, repositoryPath: repository.path)
+                        HStack {
+                            Text(commandSummary(repository))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                            Button("Configure Commands…") { configuringID = repository.id }
+                                .controlSize(.small)
+                        }
                     }
                     .padding(.vertical, 2)
                 }
@@ -74,6 +87,10 @@ struct RepositoriesSettingsView: View {
             }
 
             Section {
+                Picker("Open worktrees with", selection: $draft.editorBundleID) {
+                    Text(model.editors.first.map { "Automatic (\($0.name))" } ?? "Automatic").tag("")
+                    ForEach(model.editors) { Text($0.name).tag($0.bundleID) }
+                }
                 HStack {
                     TextField("Worktrees folder", text: $draft.worktreeRoot, prompt: Text(WorkspaceSettings.defaultWorktreeRoot))
                     Button("Choose…") { chooseWorktreeRoot() }
@@ -85,8 +102,20 @@ struct RepositoriesSettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .disabled(model.hasActiveRuns)
         .onAppear { draft = model.workspaceSettings }
         .onChange(of: draft) { model.applyWorkspaceSettings(draft) }
+        .sheet(isPresented: Binding(get: { configuringID != nil }, set: { if !$0 { configuringID = nil } })) {
+            if let index = draft.repositories.firstIndex(where: { $0.id == configuringID }) {
+                RepositoryCommandsSheet(repository: $draft.repositories[index])
+            }
+        }
+    }
+
+    private func commandSummary(_ repository: RepositoryConfig) -> String {
+        let setup = repository.setupCommands.filter(\.isEnabled).count
+        let agent = repository.agentCommands.filter(\.isEnabled).count
+        return "\(setup) setup command\(setup == 1 ? "" : "s") · Claude may run \(agent) command\(agent == 1 ? "" : "s")"
     }
 
     private func remove(_ id: String) {
@@ -111,10 +140,13 @@ struct RepositoriesSettingsView: View {
                     error = "That repository is already added."
                     return
                 }
+                let presets = CommandPresets.detect(repositoryAt: inspection.topLevel)
                 draft.repositories.append(RepositoryConfig(
                     name: URL(filePath: inspection.topLevel).lastPathComponent,
                     path: inspection.topLevel,
-                    baseBranch: inspection.defaultBranch ?? "main"
+                    baseBranch: inspection.defaultBranch ?? "main",
+                    setupCommands: presets.setup,
+                    agentCommands: presets.agent
                 ))
             } catch {
                 self.error = error.localizedDescription
@@ -141,9 +173,13 @@ struct AgentSettingsView: View {
     @State private var status: String?
     @State private var statusIsError = false
     @State private var isChecking = false
+    @State private var importStatus: String?
 
     var body: some View {
         Form {
+            if model.hasActiveRuns {
+                RunningAgentBanner()
+            }
             Section {
                 HStack {
                     TextField("Executable", text: $draft.claudePath, prompt: Text(detectedPath ?? "Not found, choose its location"))
@@ -164,6 +200,9 @@ struct AgentSettingsView: View {
                 Stepper(value: $draft.investigationTimeoutMinutes, in: 5...120, step: 5) {
                     Text("Investigation time limit: \(draft.investigationTimeoutMinutes) min")
                 }
+                Stepper(value: $draft.implementationTimeoutMinutes, in: 5...180, step: 5) {
+                    Text("Implementation time limit: \(draft.implementationTimeoutMinutes) min")
+                }
             } header: {
                 Text("Claude Code")
             } footer: {
@@ -173,12 +212,45 @@ struct AgentSettingsView: View {
                     the repository's own .claude settings, hooks and MCP servers are ignored.
                     """)
             }
+            Section {
+                TextField("PATH", text: $draft.toolPath, prompt: Text("Imported from your login shell on first implementation"), axis: .vertical)
+                    .font(.callout.monospaced())
+                    .lineLimit(1...4)
+                TextField("JAVA_HOME", text: $draft.javaHome, prompt: Text("Not set"))
+                    .font(.callout.monospaced())
+                HStack {
+                    Button("Import from Login Shell") { Task { await importEnvironment() } }
+                    if let importStatus {
+                        Text(importStatus).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Text("Build tools")
+            } footer: {
+                Text("""
+                    Apps opened from Finder don't see your shell's PATH, so java, mvn, node and pnpm would not be found. \
+                    Only PATH and JAVA_HOME are imported; nothing else from your shell profile is passed to builds.
+                    """)
+            }
         }
         .formStyle(.grouped)
+        .disabled(model.hasActiveRuns)
         .onAppear { draft = model.agentSettings }
         .onChange(of: draft) {
             model.applyAgentSettings(draft)
             status = nil
+        }
+    }
+
+    private func importEnvironment() async {
+        importStatus = "Importing…"
+        do {
+            let environment = try await ToolEnvironment.importFromLoginShell()
+            draft.toolPath = environment.path
+            draft.javaHome = environment.javaHome
+            importStatus = "Imported."
+        } catch {
+            importStatus = error.localizedDescription
         }
     }
 
@@ -213,5 +285,92 @@ struct AgentSettingsView: View {
         if panel.runModal() == .OK, let url = panel.url {
             draft.claudePath = url.path
         }
+    }
+}
+
+/// Per-repository command lists: everything detected starts checked; uncheck what isn't needed.
+private struct RepositoryCommandsSheet: View {
+    @Binding var repository: RepositoryConfig
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    CommandList(rules: $repository.setupCommands, placeholder: "e.g. pnpm install --frozen-lockfile")
+                } header: {
+                    Text("Setup commands")
+                } footer: {
+                    Text("Run by DevPilot in a fresh worktree before Claude starts, with network access, in this order. Use them to install dependencies.")
+                }
+                Section {
+                    CommandList(rules: $repository.agentCommands, placeholder: "e.g. ./mvnw or pnpm")
+                } header: {
+                    Text("Commands Claude may run")
+                } footer: {
+                    Text("Each entry allows that command with any arguments (`pnpm` allows `pnpm test`, `pnpm lint`, …). They run in the sandbox: no network, no writes outside the worktree and build caches, no git commits.")
+                }
+                Section {
+                    DisclosureGroup("Always blocked (\(CommandPresets.alwaysDenied.count))") {
+                        Text(CommandPresets.alwaysDenied.joined(separator: ", "))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            Divider()
+            HStack {
+                Button("Detect from Project") { addDetectedPresets() }
+                    .help("Adds suggested commands for the build files found in the repository. Existing entries are kept.")
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(12)
+        }
+        .frame(width: 600, height: 620)
+        .navigationTitle(repository.name)
+    }
+
+    private func addDetectedPresets() {
+        let presets = CommandPresets.detect(repositoryAt: repository.path)
+        for rule in presets.setup where !repository.setupCommands.contains(where: { $0.command == rule.command }) {
+            repository.setupCommands.append(rule)
+        }
+        for rule in presets.agent where !repository.agentCommands.contains(where: { $0.command == rule.command }) {
+            repository.agentCommands.append(rule)
+        }
+    }
+}
+
+private struct CommandList: View {
+    @Binding var rules: [CommandRule]
+    let placeholder: String
+
+    var body: some View {
+        if rules.isEmpty {
+            Text("None.").foregroundStyle(.secondary)
+        }
+        ForEach($rules) { $rule in
+            HStack {
+                Toggle("Enabled", isOn: $rule.isEnabled).labelsHidden()
+                TextField("Command", text: $rule.command, prompt: Text(placeholder))
+                    .font(.callout.monospaced())
+                    .labelsHidden()
+                    .foregroundStyle(rule.isEnabled ? .primary : .secondary)
+                Button(role: .destructive) { rules.removeAll { $0.id == rule.id } } label: { Image(systemName: "minus.circle") }
+                    .buttonStyle(.borderless)
+            }
+        }
+        Button("Add Command") { rules.append(CommandRule(command: "")) }
+    }
+}
+
+struct RunningAgentBanner: View {
+    var body: some View {
+        Label("An agent is running. Settings that affect it are locked until it finishes.", systemImage: "lock.fill")
+            .foregroundStyle(.orange)
     }
 }

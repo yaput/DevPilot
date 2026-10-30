@@ -37,9 +37,11 @@ public enum WorkflowState: String, Codable, Sendable, CaseIterable {
         case .reviewing: [.readyForHumanReview, .implementing, .failed, .cancelled]
         case .readyForHumanReview: [.completeManual, .cancelled]
         case .completeManual: []
-        // Restarting goes back through investigation and a fresh approval.
-        case .failed: [.selected, .cancelled]
-        case .cancelled: [.selected]
+        // Restarting goes back through investigation and a fresh approval. Returning to
+        // `approved` (to retry implementation) is only offered through
+        // `AppDatabase.returnToApprovedPlan`, which re-checks the approval.
+        case .failed: [.selected, .approved, .cancelled]
+        case .cancelled: [.selected, .approved]
         case .rejected: [.selected]
         }
     }
@@ -48,10 +50,12 @@ public enum WorkflowState: String, Codable, Sendable, CaseIterable {
         allowedNextStates.contains(next)
     }
 
-    /// States in which an agent or command is (or was, before a crash) executing.
+    /// States in which an agent process is (or was, before a crash) executing. `validating`
+    /// and `reviewing` are resting states until M5 runs tests and reviews in them; crash
+    /// recovery must not fail tickets that are simply waiting there.
     public var isAgentRunning: Bool {
         switch self {
-        case .investigating, .implementing, .validating, .reviewing: true
+        case .investigating, .implementing: true
         default: false
         }
     }
@@ -78,10 +82,27 @@ public enum WorkflowState: String, Codable, Sendable, CaseIterable {
     }
 }
 
-public enum WorkflowError: Error, Equatable, Sendable {
+public enum WorkflowError: Error, Equatable, Sendable, LocalizedError {
     case unknownTicket(String)
     case illegalTransition(from: WorkflowState, to: WorkflowState)
     /// The plan being approved is not the latest decision document.
     case planHashMismatch
     case decisionDocumentNotAllowed(in: WorkflowState)
+    case implementationBlocked(ImplementationGate.BlockReason)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unknownTicket(let id): "Unknown ticket \(id)."
+        case .illegalTransition(let from, let to): "Can't go from \(from.displayName) to \(to.displayName)."
+        case .planHashMismatch: "The plan changed since you opened it. Review the latest version."
+        case .decisionDocumentNotAllowed(let state): "A new plan can't be saved while the ticket is \(state.displayName)."
+        case .implementationBlocked(let reason):
+            switch reason {
+            case .wrongState(let state): "Implementation needs an approved plan; the ticket is \(state.displayName)."
+            case .missingPlan: "There is no plan to implement."
+            case .missingApproval: "The plan has not been approved."
+            case .planChangedSinceApproval: "The plan changed after it was approved. Approve the latest version first."
+            }
+        }
+    }
 }

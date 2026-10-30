@@ -10,6 +10,8 @@ public struct ProcessRequest: Sendable {
     public var environment: [String: String]
     public var stdin: Data?
     public var timeout: Duration
+    /// Called with the child's PID (which is also its process group ID) once it has started.
+    public var onLaunch: (@Sendable (pid_t) -> Void)?
 
     public init(
         executable: URL,
@@ -17,7 +19,8 @@ public struct ProcessRequest: Sendable {
         workingDirectory: URL,
         environment: [String: String],
         stdin: Data? = nil,
-        timeout: Duration
+        timeout: Duration,
+        onLaunch: (@Sendable (pid_t) -> Void)? = nil
     ) {
         self.executable = executable
         self.arguments = arguments
@@ -25,6 +28,7 @@ public struct ProcessRequest: Sendable {
         self.environment = environment
         self.stdin = stdin
         self.timeout = timeout
+        self.onLaunch = onLaunch
     }
 }
 
@@ -46,11 +50,13 @@ public struct ProcessResult: Sendable {
 
 public enum ProcessRunnerError: Error, Equatable, LocalizedError {
     case notExecutable(String)
+    case missingWorkingDirectory(String)
     case launchFailed(String, errno: Int32)
 
     public var errorDescription: String? {
         switch self {
         case .notExecutable(let path): "\(path) is not an executable file."
+        case .missingWorkingDirectory(let path): "Working directory '\(path)' does not exist."
         case .launchFailed(let path, let code): "Could not launch \(path): \(String(cString: strerror(code)))"
         }
     }
@@ -79,6 +85,12 @@ public enum ProcessRunner {
         try Task.checkCancellation()
         let path = request.executable.path
         guard FileManager.default.isExecutableFile(atPath: path) else { throw ProcessRunnerError.notExecutable(path) }
+        // Never fall back to DevPilot's own current directory.
+        var isDirectory: ObjCBool = false
+        let directory = request.workingDirectory.path
+        guard !directory.isEmpty, FileManager.default.fileExists(atPath: directory, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw ProcessRunnerError.missingWorkingDirectory(directory)
+        }
         // A child that closes stdin early must not kill DevPilot with SIGPIPE.
         signal(SIGPIPE, SIG_IGN)
 
@@ -96,6 +108,7 @@ public enum ProcessRunner {
         close(stdoutPipe.write)
         close(stderrPipe.write)
         liveGroups.withLock { _ = $0.insert(pid) }
+        request.onLaunch?(pid)
 
         let input = request.stdin ?? Data()
         let stdinFD = stdinPipe.write
@@ -131,6 +144,26 @@ public enum ProcessRunner {
         )
         try Task.checkCancellation()
         return result
+    }
+
+    /// Kills a process group left over from a previous app session (e.g. after a crash), but
+    /// only if one of its processes still looks like `expectedCommand`, so a recycled group ID
+    /// can never take down an unrelated program. Returns whether anything was killed.
+    @discardableResult
+    public static func terminateOrphanedGroup(_ group: pid_t, expectedCommand: String) async -> Bool {
+        guard group > 1, group != getpgrp() else { return false }
+        let environment = ["PATH": "/usr/bin:/bin"]
+        let home = URL(filePath: "/", directoryHint: .isDirectory)
+        guard let members = try? await run(ProcessRequest(
+            executable: URL(filePath: "/usr/bin/pgrep"), arguments: ["-g", String(group)],
+            workingDirectory: home, environment: environment, timeout: .seconds(10)
+        )), members.succeeded else { return false }
+        let pids = members.stdoutText.split(whereSeparator: \.isNewline).map(String.init)
+        guard !pids.isEmpty, let commands = try? await run(ProcessRequest(
+            executable: URL(filePath: "/bin/ps"), arguments: ["-o", "command=", "-p", pids.joined(separator: ",")],
+            workingDirectory: home, environment: environment, timeout: .seconds(10)
+        )), commands.stdoutText.contains(expectedCommand) else { return false }
+        return killpg(group, SIGKILL) == 0
     }
 
     // MARK: - Internals

@@ -15,22 +15,45 @@ extension Investigation {
     }
 }
 
-/// Agent double driven by a closure; records every request it receives.
+/// Agent double driven by closures; records every request it receives.
 final class FakeAgentRunner: AgentRunner, @unchecked Sendable {
     private let lock = NSLock()
     private var _requests: [InvestigationRequest] = []
+    private var _implementations: [ImplementationRequest] = []
     private let behavior: @Sendable (InvestigationRequest) async throws -> Investigation
+    private let implementation: @Sendable (ImplementationRequest) async throws -> ImplementationReport
 
-    init(_ behavior: @escaping @Sendable (InvestigationRequest) async throws -> Investigation) {
+    init(
+        _ behavior: @escaping @Sendable (InvestigationRequest) async throws -> Investigation = { _ in .sample() },
+        implement: @escaping @Sendable (ImplementationRequest) async throws -> ImplementationReport = { _ in .sample() }
+    ) {
         self.behavior = behavior
+        self.implementation = implement
     }
 
     var requests: [InvestigationRequest] { lock.withLock { _requests } }
+    var implementations: [ImplementationRequest] { lock.withLock { _implementations } }
 
     func investigate(_ request: InvestigationRequest, onProgress: @escaping @Sendable (String) -> Void) async throws -> (Investigation, AgentRunStats) {
         lock.withLock { _requests.append(request) }
         onProgress("Reading README.md")
         return (try await behavior(request), AgentRunStats(numTurns: 3, costUSD: 0.01))
+    }
+
+    func implement(_ request: ImplementationRequest, onProgress: @escaping @Sendable (String) -> Void) async throws -> (ImplementationReport, AgentRunStats) {
+        lock.withLock { _implementations.append(request) }
+        onProgress("Editing Sources/Webhooks.swift")
+        return (try await implementation(request), AgentRunStats(numTurns: 7, costUSD: 0.2))
+    }
+}
+
+extension ImplementationReport {
+    static func sample(outcome: Outcome = .completed) -> ImplementationReport {
+        ImplementationReport(
+            outcome: outcome, summary: "Added retries.", completedSteps: ["Add backoff"], deviations: [],
+            commands: [CommandResult(command: "./mvnw test", succeeded: true, note: "42 tests")],
+            remainingWork: [], notesForReviewer: ["Check jitter range"]
+        )
     }
 }
 

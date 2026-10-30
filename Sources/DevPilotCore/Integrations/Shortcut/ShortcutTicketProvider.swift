@@ -158,7 +158,8 @@ public struct ShortcutTicketProvider: TicketProvider {
             url: URL(string: story.appURL) ?? URL(string: "https://app.shortcut.com/\(workspace)/story/\(story.id)")!,
             comments: comments,
             acceptanceCriteria: AcceptanceCriteriaExtractor.extract(fromMarkdown: story.description ?? ""),
-            fetchedAt: fetchedAt
+            fetchedAt: fetchedAt,
+            type: TicketType(providerName: story.storyType ?? "")
         )
     }
 
@@ -202,9 +203,12 @@ public struct ShortcutTicketProvider: TicketProvider {
         let archived: Bool?
         let comments: [Comment]?
         let tasks: [Task]?
+        /// `feature`, `bug` or `chore`.
+        let storyType: String?
 
         enum CodingKeys: String, CodingKey {
             case id, name, description, archived, comments, tasks
+            case storyType = "story_type"
             case appURL = "app_url"
             case workflowStateID = "workflow_state_id"
             case ownerIDs = "owner_ids"

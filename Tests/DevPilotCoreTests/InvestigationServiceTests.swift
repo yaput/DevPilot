@@ -41,7 +41,7 @@ struct InvestigationServiceTests {
         #expect(events.withLock { $0 } == ["started", "Preparing worktree", "Reading README.md"])
 
         let workspace = try #require(try await db.workspace(ticketID: ticket.id))
-        #expect(workspace.branch == "devpilot/jira-plat-182")
+        #expect(workspace.branch == "feat/PLAT-182")
         #expect(runner.requests.first?.workspace.worktreePath == workspace.worktreePath)
         #expect(FileManager.default.fileExists(atPath: workspace.worktreePath))
 

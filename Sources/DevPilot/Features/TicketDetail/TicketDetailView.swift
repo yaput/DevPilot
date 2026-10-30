@@ -14,6 +14,9 @@ struct TicketDetailView: View {
             VStack(alignment: .leading, spacing: 24) {
                 header(state: state)
                 WorkflowPanel(ticket: ticket, state: state, detail: detail) { reviewingPlan = $0 }
+                if let run = detail.latestImplementation, let result = run.implementation {
+                    ImplementationSection(run: run, result: result)
+                }
                 if let document = detail.document {
                     DecisionRecordSection(document: document, artifacts: model.artifacts)
                 }
@@ -38,6 +41,8 @@ struct TicketDetailView: View {
                 ProviderBadge(provider: ticket.provider)
                 Text(ticket.externalID).font(.callout.monospaced()).foregroundStyle(.secondary)
                     .help(ticket.source)
+                Text("·").foregroundStyle(.secondary)
+                Text(ticket.type.displayName).foregroundStyle(.secondary)
                 Text("·").foregroundStyle(.secondary)
                 Text(ticket.status).foregroundStyle(.secondary)
                 Spacer()
@@ -66,13 +71,17 @@ struct TicketDetailView: View {
 /// answers and the entry point to plan review.
 private struct WorkflowPanel: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
     let ticket: Ticket
     let state: WorkflowState
     let detail: TicketDetailData
     let reviewPlan: (DecisionDocument) -> Void
 
     @State private var repositoryID: String?
+    /// Base branch for this ticket's new worktree; starts as the repository's setting.
+    @State private var baseBranch = ""
     @State private var answers = ""
+    @State private var confirmingDiscard = false
 
     var body: some View {
         GroupBox {
@@ -111,6 +120,9 @@ private struct WorkflowPanel: View {
                         .font(.callout.monospaced())
                 }
                 HStack {
+                    Button("View Changes") { openWindow(id: AppWindow.changes, value: ticket.id) }
+                    OpenWorktreeMenu(workspace: workspace)
+                        .fixedSize()
                     Button("Reveal in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: workspace.worktreePath)])
                     }
@@ -118,8 +130,20 @@ private struct WorkflowPanel: View {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(workspace.worktreePath, forType: .string)
                     }
+                    Spacer()
+                    Button("Discard Worktree…", role: .destructive) { confirmingDiscard = true }
+                        .disabled(state.isAgentRunning || model.isRunning(ticket.id))
                 }
                 .controlSize(.small)
+                .confirmationDialog("Discard this worktree?", isPresented: $confirmingDiscard) {
+                    Button("Discard Worktree", role: .destructive) { Task { await model.discardWorktree(ticket.id) } }
+                } message: {
+                    Text("""
+                        Removes \(workspace.worktreePath). Git refuses if it has uncommitted changes, so nothing \
+                        unsaved can be lost. Branch \(workspace.branch) is deleted only if it has no commits of its own. \
+                        The next investigation creates a new worktree from the repository's current base branch.
+                        """)
+                }
             }
         } else if model.workspaceSettings.repositories.isEmpty {
             HStack {
@@ -128,18 +152,40 @@ private struct WorkflowPanel: View {
                 SettingsLink { Text("Add Repository…") }
             }
         } else {
-            Picker("Repository", selection: $repositoryID) {
-                Text("Choose…").tag(String?.none)
-                ForEach(model.workspaceSettings.repositories) { repository in
-                    Text("\(repository.name) (\(repository.baseBranch))").tag(Optional(repository.id))
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("Repository", selection: $repositoryID) {
+                    Text("Choose…").tag(String?.none)
+                    ForEach(model.workspaceSettings.repositories) { repository in
+                        Text(repository.name).tag(Optional(repository.id))
+                    }
+                }
+                if let repository = repositoryID.flatMap(model.workspaceSettings.repository(id:)) {
+                    BaseBranchField(title: "Base branch", branch: $baseBranch, repositoryPath: repository.path)
                 }
             }
-            .frame(maxWidth: 420)
+            .frame(maxWidth: 460)
+            .onAppear { resetBaseBranch() }
+            .onChange(of: repositoryID) { resetBaseBranch() }
         }
+    }
+
+    private func resetBaseBranch() {
+        baseBranch = repositoryID.flatMap(model.workspaceSettings.repository(id:))?.baseBranch ?? ""
     }
 
     private var effectiveRepositoryID: String? {
         detail.workspace?.repositoryID ?? repositoryID
+    }
+
+    private var investigationCaption: String {
+        let source = if let workspace = detail.workspace {
+            "its existing worktree (from \(workspace.baseBranch) @ \(workspace.baseCommit.prefix(8)))"
+        } else if effectiveRepositoryID != nil {
+            "a new worktree from \(baseBranch.isEmpty ? "the repository's base branch" : baseBranch)"
+        } else {
+            "a new worktree"
+        }
+        return "Claude reads the repository in \(source). It cannot edit files or run commands during investigation."
     }
 
     // MARK: State-specific content
@@ -163,12 +209,12 @@ private struct WorkflowPanel: View {
                     startButton(state == .needsRevision ? "Re-investigate" : "Start Investigation")
                     cancelButton
                 }
-                Text("Claude reads the repository in a new worktree. It cannot edit files or run commands during investigation.")
+                Text(investigationCaption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-        case .investigating:
-            InvestigationProgress(ticketID: ticket.id)
+        case .investigating, .implementing:
+            RunProgress(ticketID: ticket.id)
         case .needsClarification:
             clarificationForm
         case .planReady, .awaitingPlanApproval:
@@ -180,22 +226,69 @@ private struct WorkflowPanel: View {
                 cancelButton
             }
         case .approved:
-            Label("Plan v\(detail.document?.version ?? 0) approved. Implementation arrives in M4.", systemImage: "checkmark.seal.fill")
-                .foregroundStyle(.green)
+            implementForm
+        case .validating:
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Implemented. Review the changes in the worktree with your IDE, then commit them yourself.", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                Text("Automatic test runs and an independent review arrive in M5.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         case .failed, .cancelled, .rejected:
             HStack {
                 Text(state == .rejected ? "Plan rejected." : "Stopped.")
                     .foregroundStyle(.secondary)
+                if canRetryImplementation, let id = effectiveRepositoryID {
+                    Button("Retry Implementation") { Task { await model.retryImplementation(ticket.id, repositoryID: id) } }
+                        .buttonStyle(.borderedProminent)
+                        .help("Goes back to the approved plan and implements it again in the same worktree.")
+                }
                 Button("Restart") { Task { await model.select(ticket.id) } }
+                    .help("Start over from investigation.")
             }
-        case .implementing, .validating, .reviewing, .readyForHumanReview, .completeManual:
+        case .reviewing, .readyForHumanReview, .completeManual:
             Text("\(state.displayName).").foregroundStyle(.secondary)
+        }
+    }
+
+    /// The last run was an implementation of a plan that is still approved.
+    private var canRetryImplementation: Bool {
+        state != .rejected && detail.runs.last?.kind == .implementation && detail.document != nil
+    }
+
+    private var implementForm: some View {
+        let repository = effectiveRepositoryID.flatMap(model.workspaceSettings.repository(id:))
+        let setup = repository?.setupCommands.filter(\.isEnabled).map(\.command) ?? []
+        let commands = repository?.agentCommands.filter(\.isEnabled).map(\.command) ?? []
+        return VStack(alignment: .leading, spacing: 8) {
+            Label("Plan v\(detail.document?.version ?? 0) approved.", systemImage: "checkmark.seal.fill")
+                .foregroundStyle(.green)
+            if let repository {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Setup: " + (setup.isEmpty ? "none" : setup.joined(separator: "; ")))
+                    Text("Claude may run: " + (commands.isEmpty ? "no commands (file edits only)" : commands.joined(separator: ", ")))
+                    Text("Edits stay in this worktree. No commits, no pushes, no network.")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                HStack {
+                    Button("Implement") { model.startImplementation(ticket.id, repositoryID: repository.id) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.isRunning(ticket.id))
+                    SettingsLink { Text("Edit Commands…") }
+                    cancelButton
+                }
+            } else {
+                Label("This ticket's repository was removed from Settings. Add it again to implement.", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
         }
     }
 
     private func startButton(_ title: String) -> some View {
         Button(title) {
-            if let id = effectiveRepositoryID { model.startInvestigation(ticket.id, repositoryID: id) }
+            if let id = effectiveRepositoryID { model.startInvestigation(ticket.id, repositoryID: id, baseBranch: baseBranch) }
         }
         .buttonStyle(.borderedProminent)
         .disabled(effectiveRepositoryID == nil || model.isRunning(ticket.id))
@@ -250,7 +343,7 @@ private struct WorkflowPanel: View {
     }
 }
 
-private struct InvestigationProgress: View {
+private struct RunProgress: View {
     @Environment(AppModel.self) private var model
     let ticketID: String
 
@@ -260,11 +353,11 @@ private struct InvestigationProgress: View {
                 HStack {
                     ProgressView().controlSize(.small)
                     TimelineView(.periodic(from: activity.startedAt, by: 1)) { context in
-                        Text("Investigating… \(Duration.seconds(context.date.timeIntervalSince(activity.startedAt)).formatted(.time(pattern: .minuteSecond)))")
+                        Text("\(activity.kind == .implementation ? "Implementing" : "Investigating")… \(Duration.seconds(context.date.timeIntervalSince(activity.startedAt)).formatted(.time(pattern: .minuteSecond)))")
                             .monospacedDigit()
                     }
                     Spacer()
-                    Button("Stop", role: .destructive) { model.stopInvestigation(ticketID) }
+                    Button("Stop", role: .destructive) { model.stopRun(ticketID) }
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(Array(activity.lines.enumerated()), id: \.offset) { index, line in
@@ -278,13 +371,84 @@ private struct InvestigationProgress: View {
             }
         } else {
             // Running according to the database but not in this session: the app was restarted.
-            Label("An investigation was in progress when DevPilot last quit. It will be marked failed on next launch.", systemImage: "exclamationmark.triangle")
+            Label("A run was in progress when DevPilot last quit. It will be stopped and marked failed on next launch.", systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.secondary)
         }
     }
 }
 
 // MARK: - Sections
+
+private struct ImplementationSection: View {
+    @Environment(\.openWindow) private var openWindow
+    let run: AgentRun
+    let result: ImplementationResult
+
+    var body: some View {
+        let report = result.report
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Implementation of plan v\(result.planVersion)").font(.headline)
+                Text(report.outcome.rawValue.capitalized)
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .foregroundStyle(report.outcome == .completed ? .green : .orange)
+                    .background((report.outcome == .completed ? Color.green : .orange).opacity(0.15), in: Capsule())
+                Spacer()
+                Button("View Changes") { openWindow(id: AppWindow.changes, value: run.ticketID) }
+                    .controlSize(.small)
+                Button("Transcript") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: run.logPath)]) }
+                    .controlSize(.small)
+            }
+            Text(report.summary).textSelection(.enabled)
+            group("Changed files (\(result.changedFiles.count))") {
+                ForEach(result.changedFiles, id: \.self) { file in
+                    HStack(spacing: 6) {
+                        Text(file.change.rawValue)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .frame(width: 70, alignment: .leading)
+                        Text(file.path).font(.callout.monospaced()).textSelection(.enabled)
+                    }
+                }
+            }
+            if !report.commands.isEmpty {
+                group("Commands run") {
+                    ForEach(report.commands, id: \.self) { command in
+                        Label {
+                            Text("`\(command.command)` \(command.note)")
+                        } icon: {
+                            Image(systemName: command.succeeded ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(command.succeeded ? .green : .red)
+                        }
+                    }
+                }
+            }
+            list("Deviations from the plan", report.deviations)
+            list("Remaining work", report.remainingWork)
+            list("Notes for the reviewer", report.notesForReviewer)
+        }
+        .padding(16)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func list(_ title: String, _ items: [String]) -> some View {
+        if !items.isEmpty {
+            group(title) {
+                ForEach(items, id: \.self) { Text("• \($0)").textSelection(.enabled) }
+            }
+        }
+    }
+
+    private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.subheadline.weight(.semibold))
+            content()
+        }
+    }
+}
 
 private struct DecisionRecordSection: View {
     let document: DecisionDocument

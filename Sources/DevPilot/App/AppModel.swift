@@ -9,10 +9,15 @@ struct TicketDetailData: Equatable {
     var document: DecisionDocument?
     var runs: [AgentRun] = []
     var events: [WorkflowEvent] = []
+
+    var latestImplementation: AgentRun? {
+        runs.last { $0.kind == .implementation }
+    }
 }
 
-/// Live progress of an investigation that is running in this app session.
+/// Live progress of an agent run in this app session.
 struct RunActivity: Equatable {
+    let kind: AgentRun.Kind
     let startedAt: Date
     var lines: [String] = []
 
@@ -25,14 +30,21 @@ struct RunActivity: Equatable {
 @MainActor
 @Observable
 final class AppModel {
+    private struct Services {
+        let investigation: InvestigationService
+        let implementation: ImplementationService
+    }
+
     private let settingsStore: SettingsStore
     private let factory: ProviderFactory
     private var orchestrator: WorkflowOrchestrator
-    private var investigations: InvestigationService
+    private var services: Services
     private var recoveredDatabasePath: String?
     @ObservationIgnored private var runTasks: [String: Task<Void, Never>] = [:]
 
     let artifacts = ArtifactStore(root: AppDatabase.defaultDirectory.appending(path: "artifacts", directoryHint: .isDirectory))
+    /// Editors installed on this Mac, detected once per launch.
+    let editors = EditorApp.installed()
 
     private(set) var settings: ProviderSettings
     private(set) var workspaceSettings: WorkspaceSettings
@@ -56,8 +68,12 @@ final class AppModel {
         self.settingsStore = settingsStore
         self.factory = factory
         let settings = settingsStore.load(ProviderSettings.self)
-        let workspaceSettings = settingsStore.load(WorkspaceSettings.self)
         let agentSettings = settingsStore.load(AgentSettings.self)
+        var workspaceSettings = settingsStore.load(WorkspaceSettings.self)
+        // Repositories added before per-repository commands existed get the detected presets.
+        if Self.fillMissingCommandPresets(&workspaceSettings) {
+            try? settingsStore.save(workspaceSettings)
+        }
         self.settings = settings
         self.workspaceSettings = workspaceSettings
         self.agentSettings = agentSettings
@@ -65,7 +81,7 @@ final class AppModel {
         self.orchestrator = orchestrator
         self.databaseLocation = databaseLocation
         self.lastError = message
-        investigations = Self.makeInvestigationService(
+        services = Self.makeServices(
             database: orchestrator.database, workspace: workspaceSettings, agent: agentSettings, artifacts: artifacts
         )
         // Child processes are in their own process groups, so they would outlive the app.
@@ -88,6 +104,8 @@ final class AppModel {
 
     var runningCount: Int { states.values.filter(\.isAgentRunning).count }
     var pendingApprovalCount: Int { states.values.filter { $0 == .awaitingPlanApproval }.count }
+    /// Settings that affect agent runs are locked while any run is in progress.
+    var hasActiveRuns: Bool { !activity.isEmpty }
 
     func state(of ticketID: String) -> WorkflowState {
         states[ticketID] ?? .discovered
@@ -107,11 +125,15 @@ final class AppModel {
     /// Re-reads saved provider settings, rebuilds providers (switching database when sample data
     /// is toggled) and syncs.
     func reconfigure() async {
+        guard !hasActiveRuns else {
+            lastError = "Settings were saved, but they take effect after the running agent finishes."
+            return
+        }
         settings = settingsStore.load(ProviderSettings.self)
         let message: String?
         (orchestrator, databaseLocation, message) = Self.makeOrchestrator(settings: settings, factory: factory)
         if let message { lastError = message }
-        rebuildInvestigationService()
+        rebuildServices()
         syncResults = [:]
         await recoverIfNeeded()
         await reload()
@@ -143,47 +165,58 @@ final class AppModel {
     }
 
     /// Runs a read-only investigation in the background. Progress appears in `activity`.
-    func startInvestigation(_ ticketID: String, repositoryID: String) {
-        guard runTasks[ticketID] == nil else { return }
+    /// `baseBranch` overrides the repository's base when the ticket has no worktree yet.
+    func startInvestigation(_ ticketID: String, repositoryID: String, baseBranch: String? = nil) {
         guard let repository = workspaceSettings.repository(id: repositoryID) else {
             lastError = "Choose a repository first. Repositories are set up in Settings → Repositories."
             return
         }
-        let service = investigations
-        let (events, continuation) = AsyncStream<InvestigationEvent>.makeStream()
-        activity[ticketID] = RunActivity(startedAt: Date())
-        runTasks[ticketID] = Task {
-            let consumer = Task {
-                for await event in events {
-                    switch event {
-                    case .started: await reload()
-                    case .progress(let line):
-                        // Copy, change, write back: reading and writing an @Observable property
-                        // in one expression is an exclusivity violation that aborts the app.
-                        if var run = activity[ticketID] {
-                            run.append(line)
-                            activity[ticketID] = run
-                        }
-                    }
-                }
-            }
-            do {
-                _ = try await service.investigate(ticketID: ticketID, repository: repository) { continuation.yield($0) }
-            } catch is CancellationError {
-                // Recorded as cancelled by the service.
-            } catch {
-                lastError = error.localizedDescription
-            }
-            continuation.finish()
-            await consumer.value
-            runTasks[ticketID] = nil
-            activity[ticketID] = nil
-            await reload()
-            detailRevision += 1
+        let service = services.investigation
+        launch(.investigation, ticketID: ticketID) { onEvent in
+            let override = baseBranch?.trimmingCharacters(in: .whitespaces)
+            _ = try await service.investigate(
+                ticketID: ticketID, repository: repository,
+                baseBranch: override?.isEmpty == false ? override : nil, onEvent: onEvent
+            )
         }
     }
 
-    func stopInvestigation(_ ticketID: String) {
+    /// Implements the approved plan in the background, with the repository's setup and agent commands.
+    func startImplementation(_ ticketID: String, repositoryID: String) {
+        guard let repository = workspaceSettings.repository(id: repositoryID) else {
+            lastError = "This ticket's repository is no longer in Settings → Repositories. Add it again to implement."
+            return
+        }
+        let service = services.implementation
+        launch(.implementation, ticketID: ticketID) { [self] onEvent in
+            var tools = agentSettings.toolEnvironment
+            if tools.path.isEmpty {
+                onEvent(.progress("Importing PATH and JAVA_HOME from your login shell"))
+                tools = try await ToolEnvironment.importFromLoginShell()
+                var updated = agentSettings
+                updated.toolPath = tools.path
+                updated.javaHome = tools.javaHome
+                persist(updated)
+                agentSettings = updated
+            }
+            _ = try await service.implement(ticketID: ticketID, repository: repository, tools: tools, onEvent: onEvent)
+        }
+    }
+
+    /// After a failed or stopped implementation: back to the approved plan, then implement again.
+    func retryImplementation(_ ticketID: String, repositoryID: String) async {
+        do {
+            try await orchestrator.database.returnToApprovedPlan(ticketID: ticketID)
+        } catch {
+            lastError = error.localizedDescription
+            await reload()
+            return
+        }
+        await reload()
+        startImplementation(ticketID, repositoryID: repositoryID)
+    }
+
+    func stopRun(_ ticketID: String) {
         runTasks[ticketID]?.cancel()
     }
 
@@ -222,20 +255,62 @@ final class AppModel {
         }
     }
 
+    /// Removes the ticket's worktree (refused if it has uncommitted changes) so the next
+    /// investigation starts fresh from the repository's current base branch.
+    func discardWorktree(_ ticketID: String) async {
+        guard !isRunning(ticketID) else { return }
+        do {
+            guard let workspace = try await orchestrator.database.workspace(ticketID: ticketID) else { return }
+            let branchDeleted = try await GitWorktreeManager(worktreeRoot: workspaceSettings.resolvedWorktreeRoot)
+                .removeWorktree(workspace)
+            try await orchestrator.database.deleteWorkspace(ticketID: ticketID)
+            if !branchDeleted {
+                lastError = "The worktree was removed. Branch \(workspace.branch) has commits, so it was kept."
+            }
+        } catch {
+            lastError = "Could not discard the worktree: \(error.localizedDescription)"
+        }
+        await reload()
+        detailRevision += 1
+    }
+
+    /// The ticket's worktree and everything in it that differs from its base commit.
+    func loadChanges(_ ticketID: String) async throws -> (TicketWorkspace, [FileDiff]) {
+        guard let workspace = try await orchestrator.database.workspace(ticketID: ticketID) else {
+            throw ImplementationError.worktreeMissing("this ticket has no worktree yet")
+        }
+        guard FileManager.default.fileExists(atPath: workspace.worktreePath) else {
+            throw ImplementationError.worktreeMissing(workspace.worktreePath)
+        }
+        let files = try await GitWorktreeManager(worktreeRoot: workspaceSettings.resolvedWorktreeRoot)
+            .diff(in: workspace.worktreePath, against: workspace.baseCommit)
+        return (workspace, files)
+    }
+
     // MARK: - Settings
 
     func applyWorkspaceSettings(_ settings: WorkspaceSettings) {
-        guard settings != workspaceSettings else { return }
+        guard settings != workspaceSettings, !hasActiveRuns else { return }
         persist(settings)
         workspaceSettings = settings
-        rebuildInvestigationService()
+        rebuildServices()
     }
 
     func applyAgentSettings(_ settings: AgentSettings) {
-        guard settings != agentSettings else { return }
+        guard settings != agentSettings, !hasActiveRuns else { return }
         persist(settings)
         agentSettings = settings
-        rebuildInvestigationService()
+        rebuildServices()
+    }
+
+    /// Branches of a repository for the base-branch pickers; empty if it can't be read.
+    func branches(inRepositoryAt path: String) async -> [GitWorktreeManager.Branch] {
+        (try? await GitWorktreeManager(worktreeRoot: workspaceSettings.resolvedWorktreeRoot).branches(inRepositoryAt: path)) ?? []
+    }
+
+    /// The editor chosen in Settings, or the first installed one.
+    var preferredEditor: EditorApp? {
+        editors.first { $0.bundleID == workspaceSettings.editorBundleID } ?? editors.first
     }
 
     var resolvedClaudeExecutable: URL? {
@@ -243,6 +318,48 @@ final class AppModel {
     }
 
     // MARK: - Internals
+
+    /// Runs `work` as the ticket's single background run, streaming its events into `activity`
+    /// in order.
+    private func launch(
+        _ kind: AgentRun.Kind,
+        ticketID: String,
+        work: @escaping (@escaping @Sendable (RunEvent) -> Void) async throws -> Void
+    ) {
+        guard runTasks[ticketID] == nil else { return }
+        let (events, continuation) = AsyncStream<RunEvent>.makeStream()
+        activity[ticketID] = RunActivity(kind: kind, startedAt: Date())
+        runTasks[ticketID] = Task {
+            let consumer = Task {
+                for await event in events {
+                    switch event {
+                    case .started:
+                        await reload()
+                    case .progress(let line):
+                        // Copy, change, write back: reading and writing an @Observable property
+                        // in one expression is an exclusivity violation that aborts the app.
+                        if var run = activity[ticketID] {
+                            run.append(line)
+                            activity[ticketID] = run
+                        }
+                    }
+                }
+            }
+            do {
+                try await work { continuation.yield($0) }
+            } catch is CancellationError {
+                // Recorded as cancelled by the service.
+            } catch {
+                lastError = error.localizedDescription
+            }
+            continuation.finish()
+            await consumer.value
+            runTasks[ticketID] = nil
+            activity[ticketID] = nil
+            await reload()
+            detailRevision += 1
+        }
+    }
 
     private func persist<T: StoredSettings>(_ settings: T) {
         do {
@@ -252,18 +369,22 @@ final class AppModel {
         }
     }
 
-    /// Runs already in progress keep the service they started with.
-    private func rebuildInvestigationService() {
-        investigations = Self.makeInvestigationService(
+    /// Runs already in progress keep the services they started with.
+    private func rebuildServices() {
+        services = Self.makeServices(
             database: orchestrator.database, workspace: workspaceSettings, agent: agentSettings, artifacts: artifacts
         )
     }
 
-    /// Runs crash recovery once per database file per launch.
+    /// Once per database file per launch: stops agent processes left over from a crash, then
+    /// marks their runs failed. Runs are never resumed automatically.
     private func recoverIfNeeded() async {
         guard recoveredDatabasePath != databaseLocation else { return }
         recoveredDatabasePath = databaseLocation
         do {
+            for group in try await orchestrator.database.unfinishedProcessGroups() {
+                await ProcessRunner.terminateOrphanedGroup(group, expectedCommand: "claude")
+            }
             let interrupted = try await orchestrator.recoverInterruptedRuns()
             if !interrupted.isEmpty {
                 lastError = "\(interrupted.count) run(s) were interrupted when DevPilot last quit and have been marked failed."
@@ -295,6 +416,18 @@ final class AppModel {
         }
     }
 
+    private static func fillMissingCommandPresets(_ settings: inout WorkspaceSettings) -> Bool {
+        var changed = false
+        for index in settings.repositories.indices
+        where settings.repositories[index].setupCommands.isEmpty && settings.repositories[index].agentCommands.isEmpty {
+            let presets = CommandPresets.detect(repositoryAt: settings.repositories[index].path)
+            settings.repositories[index].setupCommands = presets.setup
+            settings.repositories[index].agentCommands = presets.agent
+            changed = true
+        }
+        return changed
+    }
+
     /// Sample data and live data never share a database.
     private static func makeOrchestrator(
         settings: ProviderSettings,
@@ -315,22 +448,25 @@ final class AppModel {
         }
     }
 
-    private static func makeInvestigationService(
+    private static func makeServices(
         database: AppDatabase,
         workspace: WorkspaceSettings,
         agent: AgentSettings,
         artifacts: ArtifactStore
-    ) -> InvestigationService {
+    ) -> Services {
         let runner: any AgentRunner = if let executable = ClaudeCLI.resolve(configuredPath: agent.claudePath) {
-            ClaudeCodeRunner(executable: executable, model: agent.model, timeout: .seconds(max(1, agent.investigationTimeoutMinutes) * 60))
+            ClaudeCodeRunner(
+                executable: executable, model: agent.model,
+                investigationTimeout: .seconds(max(1, agent.investigationTimeoutMinutes) * 60),
+                implementationTimeout: .seconds(max(1, agent.implementationTimeoutMinutes) * 60)
+            )
         } else {
             UnavailableAgentRunner(reason: "Claude Code was not found. Set its location in Settings → Agent.")
         }
-        return InvestigationService(
-            database: database,
-            worktrees: GitWorktreeManager(worktreeRoot: workspace.resolvedWorktreeRoot),
-            runner: runner,
-            artifacts: artifacts
+        let worktrees = GitWorktreeManager(worktreeRoot: workspace.resolvedWorktreeRoot)
+        return Services(
+            investigation: InvestigationService(database: database, worktrees: worktrees, runner: runner, artifacts: artifacts),
+            implementation: ImplementationService(database: database, worktrees: worktrees, runner: runner, artifacts: artifacts)
         )
     }
 }

@@ -124,10 +124,13 @@ public struct AgentRun: Sendable, Hashable, Identifiable {
     public let costUSD: Double?
     public let logPath: String
     public let errorMessage: String?
+    /// Set for implementation runs that finished.
+    public let implementation: ImplementationResult?
 
     public init(
         id: Int64, ticketID: String, kind: Kind, startedAt: Date, finishedAt: Date?, outcome: Outcome?,
-        numTurns: Int?, costUSD: Double?, logPath: String, errorMessage: String?
+        numTurns: Int?, costUSD: Double?, logPath: String, errorMessage: String?,
+        implementation: ImplementationResult? = nil
     ) {
         self.id = id
         self.ticketID = ticketID
@@ -139,6 +142,7 @@ public struct AgentRun: Sendable, Hashable, Identifiable {
         self.costUSD = costUSD
         self.logPath = logPath
         self.errorMessage = errorMessage
+        self.implementation = implementation
     }
 }
 

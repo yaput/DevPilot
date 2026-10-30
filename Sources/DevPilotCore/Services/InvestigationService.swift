@@ -32,8 +32,8 @@ public struct ArtifactStore: Sendable {
     }
 }
 
-public enum InvestigationEvent: Sendable {
-    /// The ticket is now `investigating`.
+public enum RunEvent: Sendable {
+    /// The ticket has entered its running state (`investigating` or `implementing`).
     case started
     case progress(String)
 }
@@ -52,12 +52,14 @@ public final class InvestigationService: Sendable {
         self.artifacts = artifacts
     }
 
-    /// Starts from `selected`, `needs_clarification` or `needs_revision`. The repository is only
-    /// used when the ticket has no worktree yet; afterwards the ticket stays on its worktree.
+    /// Starts from `selected`, `needs_clarification` or `needs_revision`. The repository and
+    /// `baseBranch` (default: the repository's) are only used when the ticket has no worktree yet;
+    /// afterwards the ticket stays on its worktree.
     public func investigate(
         ticketID: String,
         repository: RepositoryConfig,
-        onEvent: @escaping @Sendable (InvestigationEvent) -> Void
+        baseBranch: String? = nil,
+        onEvent: @escaping @Sendable (RunEvent) -> Void
     ) async throws -> DecisionDocument {
         guard let ticket = try await database.ticket(id: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
         let logURL = artifacts.runLogURL(ticketID: ticketID, kind: .investigation, at: Date())
@@ -69,13 +71,16 @@ public final class InvestigationService: Sendable {
 
         do {
             onEvent(.progress("Preparing worktree"))
-            let workspace = try await workspace(for: ticket, repository: repository)
+            let workspace = try await workspace(for: ticket, repository: repository, baseBranch: baseBranch)
             let request = InvestigationRequest(
                 ticket: ticket,
                 workspace: workspace,
                 previousPlan: try await database.latestDecisionDocument(ticketID: ticketID),
                 guidance: try await database.guidance(ticketID: ticketID),
-                logURL: logURL
+                logURL: logURL,
+                onLaunch: { [database] group in
+                    Task { try? await database.recordProcessGroup(runID: runID, processGroup: group) }
+                }
             )
             let (investigation, stats) = try await runner.investigate(request) { onEvent(.progress($0)) }
             let markdown = DecisionDocumentRenderer.render(investigation, ticket: ticket, workspace: workspace)
@@ -101,12 +106,12 @@ public final class InvestigationService: Sendable {
         }
     }
 
-    private func workspace(for ticket: Ticket, repository: RepositoryConfig) async throws -> TicketWorkspace {
+    private func workspace(for ticket: Ticket, repository: RepositoryConfig, baseBranch: String?) async throws -> TicketWorkspace {
         if let existing = try await database.workspace(ticketID: ticket.id),
            FileManager.default.fileExists(atPath: existing.worktreePath) {
             return existing
         }
-        let workspace = try await worktrees.prepareWorktree(for: ticket, repository: repository)
+        let workspace = try await worktrees.prepareWorktree(for: ticket, repository: repository, baseBranch: baseBranch)
         try await database.saveWorkspace(workspace)
         return workspace
     }

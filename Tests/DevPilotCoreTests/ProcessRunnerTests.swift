@@ -74,6 +74,14 @@ struct ProcessRunnerTests {
         #expect(ContinuousClock.now - started < .seconds(5))
     }
 
+    @Test func rejectsMissingWorkingDirectory() async {
+        var missing = request("/bin/pwd", [])
+        missing.workingDirectory = URL(filePath: "/nonexistent/devpilot")
+        await #expect(throws: ProcessRunnerError.missingWorkingDirectory("/nonexistent/devpilot")) {
+            _ = try await ProcessRunner.run(missing)
+        }
+    }
+
     @Test func rejectsNonExecutables() async {
         await #expect(throws: ProcessRunnerError.notExecutable("/etc/hosts")) {
             _ = try await ProcessRunner.run(request("/etc/hosts", []))

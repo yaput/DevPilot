@@ -7,9 +7,10 @@ struct TestRepository {
     let repo: URL
     let worktrees: URL
 
-    init(files: [String: String] = ["README.md": "# Test\n"]) async throws {
-        root = FileManager.default.temporaryDirectory
-            .appending(path: "devpilot-git-\(UUID().uuidString)", directoryHint: .isDirectory)
+    /// `base` defaults to the temp folder; live sandbox tests pass a folder under HOME, because the
+    /// sandbox treats temp folders as writable.
+    init(files: [String: String] = ["README.md": "# Test\n"], base: URL = FileManager.default.temporaryDirectory) async throws {
+        root = base.appending(path: "devpilot-git-\(UUID().uuidString)", directoryHint: .isDirectory)
         repo = root.appending(path: "repo", directoryHint: .isDirectory)
         worktrees = root.appending(path: "worktrees", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)

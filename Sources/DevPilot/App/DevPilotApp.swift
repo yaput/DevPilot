@@ -20,6 +20,14 @@ struct DevPilotApp: App {
                 .task { await model.start() }
         }
 
+        WindowGroup("Changes", id: AppWindow.changes, for: String.self) { $ticketID in
+            if let ticketID {
+                ChangesView(ticketID: ticketID)
+                    .environment(model)
+                    .frame(minWidth: 900, minHeight: 560)
+            }
+        }
+
         Settings {
             SettingsView()
                 .environment(model)
@@ -37,4 +45,5 @@ struct DevPilotApp: App {
 
 enum AppWindow {
     static let dashboard = "dashboard"
+    static let changes = "changes"
 }

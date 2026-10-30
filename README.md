@@ -14,8 +14,8 @@ DevPilot never commits, pushes, deploys or opens PRs. See
 | M1 | App shell, menu bar, settings shell, mock tickets, SQLite, state machine + tests | Done |
 | M2 | Shortcut and Jira Cloud adapters, configurable URLs, Keychain credentials | Done |
 | M3 | Repo mapping, worktrees, read-only Claude Code investigation, decision record, approval | Done |
-| M4 | Sandboxed implementation runs, cancellation, budgets | Next |
-| M5 | Test runner, independent review, diff viewer, notifications | |
+| M4 | Sandboxed implementation in the worktree, per-repo commands, integration branch names | Done |
+| M5 | Test runner, independent review, diff viewer, notifications, worktree cleanup | Next |
 
 ## Requirements
 
@@ -32,7 +32,8 @@ DevPilot never commits, pushes, deploys or opens PRs. See
 
 ```bash
 swift test                          # unit tests (DevPilotCore)
-DEVPILOT_LIVE_CLAUDE=1 swift test --filter LiveClaudeTests   # one real Claude run (uses quota)
+DEVPILOT_LIVE_CLAUDE=1 swift test --filter LiveClaudeTests   # real Claude runs (uses quota): read-only
+                                                             # investigation + sandboxed implementation that must not commit
 swift run DevPilot                  # quick dev run, no app bundle
 scripts/build-app.sh                # build/DevPilot.app, ad-hoc signed
 scripts/build-app.sh --install      # also copy to /Applications
@@ -102,6 +103,35 @@ untrusted data. Git hooks are disabled while DevPilot creates worktrees.
 Decision records and full agent transcripts (prompt, stream-json, stderr) are kept outside
 every worktree, in `~/Library/Application Support/DevPilot/artifacts/<ticket>/`.
 
+## Implementing an approved plan (M4)
+
+On an approved ticket, **Implement** does the following:
+1. Re-checks that the approval still matches the latest plan, word for word.
+2. Runs the repository's checked **setup commands** in the worktree (e.g. `pnpm install`), with
+   network access. These are your commands, run by DevPilot, not by Claude.
+3. Runs Claude with the approved plan. Claude can edit files **in that worktree only** and run
+   **only the checked commands** for the repository, inside Claude Code's sandbox: no network, no
+   writes outside the worktree and build caches (`~/.m2`, `~/.gradle`, npm/pnpm stores), no reads of
+   `~/.ssh`, cloud credentials or shell profiles, and the git metadata is read-only, so commits fail.
+4. Verifies HEAD did not move, lists the changed files, and moves the ticket to *Validating* with
+   Claude's report (what was done, commands run, deviations, remaining work).
+
+You then review the changes in your IDE and commit them yourself. If a run fails or you stop it,
+**Retry Implementation** goes back to the approved plan; **Restart** starts over from investigation.
+
+**Per-repository commands:** Settings → Repositories → *Configure Commands…*. Detected
+automatically from build files (top level and up to two folders down, for monorepos): Maven,
+Gradle, npm, pnpm, yarn. Everything starts checked; uncheck what you don't want. Some commands
+are always blocked (git writes, publish/deploy, curl, ssh, sudo).
+
+**Build tools:** apps opened from Finder don't see your shell's `PATH`/`JAVA_HOME`. DevPilot
+imports just those two from your login shell on first implementation (Settings → Agent →
+*Import from Login Shell* to refresh).
+
+**Branches:** new worktrees use your trackers' conventions so integrations link the PR:
+`feat/sc-4211`, `fix/sc-4230`, `chore/sc-4300` (Shortcut) and `feat/PLAT-182`, `fix/MOB-77`
+(Jira). Bugs get `fix/`, chores/tasks `chore/`, everything else `feat/`.
+
 ### Signing
 
 Ad-hoc signing (the default) is enough to run on your own Mac. Because an ad-hoc signature
@@ -162,10 +192,12 @@ scripts/build-app.sh       bundle + sign
 - Worktrees are never deleted automatically. Remove one with `git worktree remove <path>` from
   the repository once you are done.
 - Worktrees branch from the *local* base branch. Pull it first if you want the latest code.
-- If DevPilot is force-quit mid-run, the Claude process is stopped on normal quit but not on a crash.
-  Investigation is read-only, so an orphaned run cannot change anything. M4 must handle this for
-  write-enabled runs.
-- M4: workspace-write implementation runs (Claude Code sandbox, approved-command allowlist,
-  no git commit/push), per-repo dependency setup command for fresh worktrees, blocking
-  settings changes while a run is active.
-- M5: see milestones above and the spec.
+- After a crash, leftover Claude processes are stopped on the next launch (matched by process
+  group *and* command, so an unrelated program can never be killed).
+- Maven and Gradle builds inside the sandbox have not been verified against a real project yet.
+  npm, pnpm, `javac`/`java` have. If a Gradle/Maven command fails with a sandbox violation, the
+  transcript shows which path or connection was denied.
+- Command rules match the start of a command (`pnpm` allows `pnpm anything`). Publishing and
+  deploying are blocked by the deny list and, regardless of wording, by the network being off.
+- M5: running the approved tests independently, a separate read-only review, diff viewer,
+  notifications, worktree cleanup when a ticket is done.

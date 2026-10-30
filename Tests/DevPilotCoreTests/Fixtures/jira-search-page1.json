@@ -5,6 +5,7 @@
       "key": "PLAT-182",
       "fields": {
         "summary": "Rate-limit public API by API key",
+        "issuetype": { "name": "Story" },
         "status": { "name": "To Do", "statusCategory": { "key": "new" } },
         "assignee": { "accountId": "abc", "displayName": "Jane Doe" },
         "description": {

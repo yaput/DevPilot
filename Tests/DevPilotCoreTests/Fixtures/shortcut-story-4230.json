@@ -1,5 +1,6 @@
 {
   "id": 4230,
+  "story_type": "bug",
   "name": "Fix timezone bug in daily digest",
   "description": "Users in UTC+9 receive the digest a day late.",
   "app_url": "https://app.shortcut.com/acme/story/4230",

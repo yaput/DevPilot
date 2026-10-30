@@ -74,14 +74,36 @@ stored claude.ai login. `ANTHROPIC_API_KEY` is never passed to it.
 
 Prompt instructions are not security controls. Enforcement relies on:
 
-- **Investigation and review (read-only, implemented in M3):** `--tools Read,Grep,Glob` so no
-  other tools exist, `--permission-mode dontAsk` so anything not allowed is denied,
-  `--setting-sources user` plus `--strict-mcp-config` with no servers so the repository's
-  `.claude/settings.json`, hooks and `.mcp.json` are ignored, `--no-session-persistence`, and a
-  JSON schema for the result. Verified against Claude Code 2.1.314: in this configuration a
-  repository hook did not run and its `Bash(*)` permission was ignored.
-- **Implementation (M4):** write tools limited to the ticket worktree via Claude Code's sandbox,
-  shell commands limited to an approved allowlist, `git commit`/`git push` and network denied.
+- **All runs:** `--permission-mode dontAsk` (anything not explicitly allowed is denied),
+  `--setting-sources ""` plus `--strict-mcp-config` with no servers (no settings, hooks or MCP
+  servers from the repository *or* the user's own `~/.claude`, whose allow rules would otherwise
+  merge in), `--no-session-persistence`, a JSON schema for the result, and file access scoped to
+  the worktree with `Read(//<worktree>/**)` (which also governs Grep and Glob).
+- **Investigation and review (read-only):** `--tools Read,Grep,Glob`.
+- **Implementation:** additionally `Edit(//<worktree>/**)` (covers Write) with
+  `Edit(//<worktree>/.git)` denied; `Bash(<prefix>:*)` only for the repository's checked
+  commands plus a fixed deny list; and Claude Code's sandbox via `--settings`:
+  `enabled`, `failIfUnavailable`, `allowUnsandboxedCommands: false`, no allowed network domains,
+  write access to build caches only, `denyWrite` on the main repository's `.git` and the
+  worktree's `.git` file, `denyRead` on credential stores and shell profiles. Paths are resolved
+  through symlinks first.
+- After each implementation run DevPilot checks that HEAD did not move.
+
+Verified against Claude Code 2.1.314 with real runs, judged by the filesystem and git rather than
+the model's own report:
+  - A repository hook did not run and its `Bash(*)` permission was ignored.
+  - Grep/Glob/Read outside the worktree, and Write outside it, were denied.
+  - `curl` was blocked by the sandbox network rules.
+  - `git commit` and `sh -c 'git commit …'` failed with "Operation not permitted" once the git
+    directory was in `denyWrite`. **Without that rule the commit succeeded:** the sandbox lets
+    commands write to the repository's git directory by default, so the git layout alone is not
+    a protection.
+  - Reads of `~/.zshrc` and `~/.ssh` were denied; `ANTHROPIC_API_KEY` was absent from commands'
+    environment.
+  - `npm test`, `pnpm test`, `javac` and `java` worked inside the sandbox.
+- Setup commands (dependency installation) are configured by the user and run by DevPilot via
+  `/bin/sh -c`, with network access, outside the agent sandbox. That is equivalent to the user
+  running them in a terminal.
 - A worktree's Git metadata lives in the main repo's `.git/worktrees/<name>`, outside the
   writable root, so commits from inside the sandbox should fail. This must be covered by
   an integration test, not assumed.

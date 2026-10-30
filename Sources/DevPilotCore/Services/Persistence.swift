@@ -113,6 +113,13 @@ public final class AppDatabase: Sendable {
                 ALTER TABLE decisionDocument ADD COLUMN investigationJSON TEXT;
                 """)
         }
+        migrator.registerMigration("v3-ticket-type-and-implementation") { db in
+            try db.execute(sql: """
+                ALTER TABLE ticket ADD COLUMN type TEXT NOT NULL DEFAULT 'feature';
+                ALTER TABLE agentRun ADD COLUMN reportJSON TEXT;
+                ALTER TABLE agentRun ADD COLUMN processGroup INTEGER;
+                """)
+        }
         return migrator
     }
 
@@ -128,19 +135,19 @@ public final class AppDatabase: Sendable {
                 try db.execute(
                     sql: """
                         INSERT INTO ticket (id, provider, source, externalID, title, description, status, assignee, url,
-                                            commentsJSON, acceptanceCriteriaJSON, fetchedAt, isAssigned)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                                            commentsJSON, acceptanceCriteriaJSON, fetchedAt, isAssigned, type)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                         ON CONFLICT(id) DO UPDATE SET
                             title = excluded.title, description = excluded.description, status = excluded.status,
                             assignee = excluded.assignee, url = excluded.url, commentsJSON = excluded.commentsJSON,
                             acceptanceCriteriaJSON = excluded.acceptanceCriteriaJSON, fetchedAt = excluded.fetchedAt,
-                            isAssigned = 1
+                            isAssigned = 1, type = excluded.type
                         """,
                     arguments: [
                         ticket.id, ticket.provider.rawValue, ticket.source, ticket.externalID, ticket.title,
                         ticket.description, ticket.status, ticket.assignee, ticket.url.absoluteString,
                         try Self.json(ticket.comments), try Self.json(ticket.acceptanceCriteria),
-                        ticket.fetchedAt.timeIntervalSince1970,
+                        ticket.fetchedAt.timeIntervalSince1970, ticket.type.rawValue,
                     ]
                 )
                 let isNew = try Self.fetchState(db, ticketID: ticket.id) == nil
@@ -397,9 +404,19 @@ public final class AppDatabase: Sendable {
     }
 
     /// Closes a run that did not succeed and moves a still-running ticket to `cancelled` or `failed`.
-    public func finishRun(runID: Int64, ticketID: String, outcome: AgentRun.Outcome, message: String) async throws {
+    /// `result` keeps the agent's report when it stopped on its own (e.g. blocked).
+    public func finishRun(
+        runID: Int64,
+        ticketID: String,
+        outcome: AgentRun.Outcome,
+        message: String,
+        result: ImplementationResult? = nil
+    ) async throws {
         try await writer.write { db in
             try Self.closeRun(db, runID: runID, outcome: outcome, stats: nil, message: message)
+            if let result {
+                try db.execute(sql: "UPDATE agentRun SET reportJSON = ? WHERE id = ?", arguments: [try Self.json(result), runID])
+            }
             guard try Self.fetchState(db, ticketID: ticketID)?.isAgentRunning == true else { return }
             try Self.applyTransition(
                 db, ticketID: ticketID, to: outcome == .cancelled ? .cancelled : .failed, kind: .transition, message: message
@@ -415,9 +432,98 @@ public final class AppDatabase: Sendable {
                     startedAt: Date(timeIntervalSince1970: row["startedAt"]),
                     finishedAt: (row["finishedAt"] as Double?).map(Date.init(timeIntervalSince1970:)),
                     outcome: (row["outcome"] as String?).flatMap(AgentRun.Outcome.init(rawValue:)),
-                    numTurns: row["numTurns"], costUSD: row["costUSD"], logPath: row["logPath"], errorMessage: row["errorMessage"]
+                    numTurns: row["numTurns"], costUSD: row["costUSD"], logPath: row["logPath"], errorMessage: row["errorMessage"],
+                    implementation: (row["reportJSON"] as String?).flatMap {
+                        try? JSONDecoder().decode(ImplementationResult.self, from: Data($0.utf8))
+                    }
                 )
             }
+        }
+    }
+
+    /// Re-checks the approval gate and claims the ticket for implementation in one transaction,
+    /// so nothing can change the plan or approval between the check and the start.
+    public func beginImplementation(ticketID: String, logPath: String) async throws -> (runID: Int64, plan: DecisionDocument) {
+        try await writer.write { db in
+            guard let state = try Self.fetchState(db, ticketID: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
+            let plan = try Self.fetchLatestDocument(db, ticketID: ticketID)
+            let verdict = ImplementationGate.evaluate(
+                state: state, latestDocument: plan, latestApproval: try Self.fetchLatestApproval(db, ticketID: ticketID)
+            )
+            guard case .allowed = verdict, let plan else {
+                if case .blocked(let reason) = verdict { throw WorkflowError.implementationBlocked(reason) }
+                throw WorkflowError.implementationBlocked(.missingPlan)
+            }
+            try Self.applyTransition(
+                db, ticketID: ticketID, to: .implementing, kind: .transition,
+                message: "Implementation of plan v\(plan.version) started"
+            )
+            try db.execute(
+                sql: "INSERT INTO agentRun (ticketID, kind, startedAt, logPath) VALUES (?, ?, ?, ?)",
+                arguments: [ticketID, AgentRun.Kind.implementation.rawValue, Date().timeIntervalSince1970, logPath]
+            )
+            return (db.lastInsertedRowID, plan)
+        }
+    }
+
+    /// After a failed or stopped implementation, goes back to `approved` so it can be retried,
+    /// but only if the latest plan's approval is still valid.
+    public func returnToApprovedPlan(ticketID: String) async throws {
+        try await writer.write { db in
+            guard let state = try Self.fetchState(db, ticketID: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
+            guard state == .failed || state == .cancelled else { throw WorkflowError.illegalTransition(from: state, to: .approved) }
+            let plan = try Self.fetchLatestDocument(db, ticketID: ticketID)
+            let verdict = ImplementationGate.evaluate(
+                state: .approved, latestDocument: plan, latestApproval: try Self.fetchLatestApproval(db, ticketID: ticketID)
+            )
+            if case .blocked(let reason) = verdict { throw WorkflowError.implementationBlocked(reason) }
+            try Self.applyTransition(
+                db, ticketID: ticketID, to: .approved, kind: .transition,
+                message: "Back to approved plan v\(plan?.version ?? 0) to retry implementation"
+            )
+        }
+    }
+
+    /// Closes a successful implementation run and moves the ticket on to `validating`.
+    public func completeImplementation(
+        runID: Int64,
+        ticketID: String,
+        result: ImplementationResult,
+        stats: AgentRunStats
+    ) async throws {
+        try await writer.write { db in
+            try Self.closeRun(db, runID: runID, outcome: .succeeded, stats: stats, message: nil)
+            try db.execute(sql: "UPDATE agentRun SET reportJSON = ? WHERE id = ?", arguments: [try Self.json(result), runID])
+            let count = result.changedFiles.count
+            try Self.applyTransition(
+                db, ticketID: ticketID, to: .validating, kind: .transition,
+                message: "Implementation \(result.report.outcome.rawValue): \(count) file\(count == 1 ? "" : "s") changed"
+            )
+        }
+    }
+
+    /// Forgets a ticket's worktree after it was removed, so the next investigation creates a new
+    /// one from the repository's current base branch. Not allowed while a run is active.
+    public func deleteWorkspace(ticketID: String) async throws {
+        try await writer.write { db in
+            if let state = try Self.fetchState(db, ticketID: ticketID), state.isAgentRunning {
+                throw WorkflowError.illegalTransition(from: state, to: state)
+            }
+            try db.execute(sql: "DELETE FROM ticketWorkspace WHERE ticketID = ?", arguments: [ticketID])
+        }
+    }
+
+    /// Remembers the OS process group of a running agent so it can be stopped after a crash.
+    public func recordProcessGroup(runID: Int64, processGroup: Int32) async throws {
+        try await writer.write { db in
+            try db.execute(sql: "UPDATE agentRun SET processGroup = ? WHERE id = ?", arguments: [processGroup, runID])
+        }
+    }
+
+    /// Process groups of runs that never finished, i.e. the app stopped while they ran.
+    public func unfinishedProcessGroups() async throws -> [Int32] {
+        try await writer.read { db in
+            try Int32.fetchAll(db, sql: "SELECT processGroup FROM agentRun WHERE finishedAt IS NULL AND processGroup IS NOT NULL")
         }
     }
 
@@ -570,7 +676,8 @@ public final class AppDatabase: Sendable {
             url: url,
             comments: try decoder.decode([TicketComment].self, from: Data((row["commentsJSON"] as String).utf8)),
             acceptanceCriteria: try decoder.decode([String].self, from: Data((row["acceptanceCriteriaJSON"] as String).utf8)),
-            fetchedAt: Date(timeIntervalSince1970: row["fetchedAt"])
+            fetchedAt: Date(timeIntervalSince1970: row["fetchedAt"]),
+            type: TicketType(rawValue: row["type"]) ?? .feature
         )
     }
 
