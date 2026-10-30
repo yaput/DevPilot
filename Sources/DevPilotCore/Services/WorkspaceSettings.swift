@@ -25,10 +25,13 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
     public var setupCommands: [CommandRule]
     /// Command prefixes the agent may run during implementation, e.g. `./mvnw` or `pnpm`.
     public var agentCommands: [CommandRule]
+    /// Full commands DevPilot runs (sandboxed) after implementation to verify the change, e.g.
+    /// `cd services/ui && pnpm test`. Each must exit 0 to pass.
+    public var validationCommands: [CommandRule]
 
     public init(
         id: String = UUID().uuidString, name: String, path: String, baseBranch: String,
-        setupCommands: [CommandRule] = [], agentCommands: [CommandRule] = []
+        setupCommands: [CommandRule] = [], agentCommands: [CommandRule] = [], validationCommands: [CommandRule] = []
     ) {
         self.id = id
         self.name = name
@@ -36,6 +39,7 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
         self.baseBranch = baseBranch
         self.setupCommands = setupCommands
         self.agentCommands = agentCommands
+        self.validationCommands = validationCommands
     }
 
     public init(from decoder: Decoder) throws {
@@ -46,6 +50,7 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
         baseBranch = try container.decode(String.self, forKey: .baseBranch)
         setupCommands = try container.decodeIfPresent([CommandRule].self, forKey: .setupCommands) ?? []
         agentCommands = try container.decodeIfPresent([CommandRule].self, forKey: .agentCommands) ?? []
+        validationCommands = try container.decodeIfPresent([CommandRule].self, forKey: .validationCommands) ?? []
     }
 }
 
@@ -72,10 +77,11 @@ public enum CommandPresets {
 
     /// Looks for build files at the top level and up to two folders down (monorepos such as
     /// `services/api` + `services/ui`). Commands for sub-projects `cd` into them first.
-    public static func detect(repositoryAt path: String) -> (setup: [CommandRule], agent: [CommandRule]) {
+    public static func detect(repositoryAt path: String) -> (setup: [CommandRule], agent: [CommandRule], validation: [CommandRule]) {
         let root = URL(filePath: path, directoryHint: .isDirectory)
         var setup: [String] = []
         var agent: [String] = []
+        var validation: [String] = []
         func add(_ command: String) {
             if !agent.contains(command) { agent.append(command) }
         }
@@ -90,36 +96,60 @@ public enum CommandPresets {
             let isJava = has("mvnw") || has("pom.xml") || has("gradlew") || has("build.gradle") || has("build.gradle.kts")
             if has("mvnw") {
                 setup.append(cd + "./mvnw -B -q -DskipTests verify")
+                validation.append(cd + "./mvnw -B -o test")
                 add("./mvnw")
             } else if has("pom.xml") {
                 setup.append(cd + "mvn -B -q -DskipTests verify")
+                validation.append(cd + "mvn -B -o test")
                 add("mvn")
             }
             if has("gradlew") {
                 setup.append(cd + "./gradlew --no-daemon -q testClasses")
+                validation.append(cd + "./gradlew --no-daemon --offline test")
                 add("./gradlew")
             } else if has("build.gradle") || has("build.gradle.kts") {
                 setup.append(cd + "gradle --no-daemon -q testClasses")
+                validation.append(cd + "gradle --no-daemon --offline test")
                 add("gradle")
             }
             if isJava { add("java") }
             if has("package.json") {
+                let runner: String
                 if has("pnpm-lock.yaml") {
                     setup.append(cd + "pnpm install --frozen-lockfile")
                     add("pnpm")
+                    runner = "pnpm run"
                 } else if has("yarn.lock") {
                     setup.append(cd + "yarn install --frozen-lockfile")
                     add("yarn")
+                    runner = "yarn run"
                 } else {
                     setup.append(cd + (has("package-lock.json") ? "npm ci" : "npm install"))
                     add("npm")
+                    runner = "npm run"
                 }
                 add("npx")
                 add("node")
+                let scripts = packageScripts(at: root.appending(path: project).appending(path: "package.json"))
+                for script in ["typecheck", "type-check", "check-types", "lint", "test"] where scripts.contains(script) {
+                    validation.append(cd + "\(runner) \(script)")
+                }
             }
         }
         (gitInspection + shellUtilities).forEach(add)
-        return (setup.map { CommandRule(command: $0) }, agent.map { CommandRule(command: $0) })
+        return (
+            setup.map { CommandRule(command: $0) },
+            agent.map { CommandRule(command: $0) },
+            validation.map { CommandRule(command: $0) }
+        )
+    }
+
+    /// Script names declared in a package.json; empty if it can't be read.
+    static func packageScripts(at url: URL) -> Set<String> {
+        guard let data = try? Data(contentsOf: url),
+              let json = try? JSONDecoder().decode(JSONValue.self, from: data),
+              case .object(let scripts)? = json["scripts"] else { return [] }
+        return Set(scripts.keys)
     }
 
     private static let buildFiles = [
@@ -183,6 +213,9 @@ public struct WorkspaceSettings: StoredSettings {
     public var worktreeRoot = Self.defaultWorktreeRoot
     /// Bundle identifier of the app used for "Open in…". Empty means the first one installed.
     public var editorBundleID = ""
+    /// Bumped when new kinds of per-repository presets are introduced, so existing repositories
+    /// are filled in once (and never again, so the user can clear a list).
+    public var presetsVersion = 0
 
     public init() {}
 
@@ -193,6 +226,7 @@ public struct WorkspaceSettings: StoredSettings {
         rules = try container.decodeIfPresent([RepositoryRule].self, forKey: .rules) ?? rules
         worktreeRoot = try container.decodeIfPresent(String.self, forKey: .worktreeRoot) ?? worktreeRoot
         editorBundleID = try container.decodeIfPresent(String.self, forKey: .editorBundleID) ?? editorBundleID
+        presetsVersion = try container.decodeIfPresent(Int.self, forKey: .presetsVersion) ?? presetsVersion
     }
 
     public func repository(id: String) -> RepositoryConfig? {
@@ -232,6 +266,10 @@ public struct AgentSettings: StoredSettings {
     public var model = ""
     public var investigationTimeoutMinutes = 20
     public var implementationTimeoutMinutes = 30
+    /// Per validation command.
+    public var validationTimeoutMinutes = 20
+    /// How many times Claude may automatically try to fix failing validation before hand-off.
+    public var automaticFixAttempts = 1
     /// PATH and JAVA_HOME for build tools, imported from the login shell (GUI apps don't get them).
     public var toolPath = ""
     public var javaHome = ""
@@ -245,6 +283,8 @@ public struct AgentSettings: StoredSettings {
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? model
         investigationTimeoutMinutes = try container.decodeIfPresent(Int.self, forKey: .investigationTimeoutMinutes) ?? investigationTimeoutMinutes
         implementationTimeoutMinutes = try container.decodeIfPresent(Int.self, forKey: .implementationTimeoutMinutes) ?? implementationTimeoutMinutes
+        validationTimeoutMinutes = try container.decodeIfPresent(Int.self, forKey: .validationTimeoutMinutes) ?? validationTimeoutMinutes
+        automaticFixAttempts = try container.decodeIfPresent(Int.self, forKey: .automaticFixAttempts) ?? automaticFixAttempts
         toolPath = try container.decodeIfPresent(String.self, forKey: .toolPath) ?? toolPath
         javaHome = try container.decodeIfPresent(String.self, forKey: .javaHome) ?? javaHome
     }

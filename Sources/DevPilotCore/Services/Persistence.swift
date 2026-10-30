@@ -7,7 +7,7 @@ import GRDB
 /// Every state change goes through `applyTransition` inside a single write transaction,
 /// together with its audit event, so a crash can never leave state and history out of sync.
 public final class AppDatabase: Sendable {
-    private let writer: any DatabaseWriter
+    let writer: any DatabaseWriter
 
     public init(_ writer: any DatabaseWriter) throws {
         self.writer = writer
@@ -120,8 +120,36 @@ public final class AppDatabase: Sendable {
                 ALTER TABLE agentRun ADD COLUMN processGroup INTEGER;
                 """)
         }
+        migrator.registerMigration("v4-attempts") { db in
+            // History is scoped to an attempt; "Start Over" begins a new one. Older attempts stay
+            // in the database as an audit trail but are no longer shown or used as context.
+            try db.execute(sql: """
+                ALTER TABLE ticketWorkflow ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE workflowEvent ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE agentRun ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE approval ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;
+                CREATE TABLE decisionDocumentNew (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticketID TEXT NOT NULL REFERENCES ticket(id),
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    version INTEGER NOT NULL,
+                    markdown TEXT NOT NULL,
+                    contentHash TEXT NOT NULL,
+                    createdAt REAL NOT NULL,
+                    investigationJSON TEXT,
+                    UNIQUE (ticketID, attempt, version)
+                );
+                INSERT INTO decisionDocumentNew (id, ticketID, attempt, version, markdown, contentHash, createdAt, investigationJSON)
+                    SELECT id, ticketID, 1, version, markdown, contentHash, createdAt, investigationJSON FROM decisionDocument;
+                DROP TABLE decisionDocument;
+                ALTER TABLE decisionDocumentNew RENAME TO decisionDocument;
+                """)
+        }
         return migrator
     }
+
+    /// SQL for the ticket's current attempt; bind the ticket ID where it appears.
+    private static let currentAttempt = "(SELECT attempt FROM ticketWorkflow WHERE ticketWorkflow.ticketID = ?)"
 
     // MARK: - Tickets
 
@@ -225,13 +253,20 @@ public final class AppDatabase: Sendable {
     /// Runs are never resumed automatically; the user has to restart them explicitly.
     public func failInterruptedRuns(message: String) async throws -> [String] {
         try await writer.write { db in
+            // Tickets in a running state, or with a run that never finished (validation and
+            // review run while the ticket rests in `validating` / `reviewing`).
             let running = WorkflowState.allCases.filter(\.isAgentRunning).map(\.rawValue)
             let ids = try String.fetchAll(
                 db,
-                sql: "SELECT ticketID FROM ticketWorkflow WHERE state IN (\(running.map { _ in "?" }.joined(separator: ",")))",
+                sql: """
+                    SELECT ticketID FROM ticketWorkflow
+                    WHERE state IN (\(running.map { _ in "?" }.joined(separator: ",")))
+                       OR (ticketID IN (SELECT ticketID FROM agentRun WHERE finishedAt IS NULL)
+                           AND state NOT IN ('failed', 'cancelled', 'complete_manual'))
+                    """,
                 arguments: StatementArguments(running)
             )
-            for id in ids {
+            for id in ids where try Self.fetchState(db, ticketID: id)?.canTransition(to: .failed) == true {
                 try Self.applyTransition(db, ticketID: id, to: .failed, kind: .transition, message: message)
             }
             try db.execute(
@@ -244,7 +279,10 @@ public final class AppDatabase: Sendable {
 
     public func events(ticketID: String) async throws -> [WorkflowEvent] {
         try await writer.read { db in
-            try Row.fetchAll(db, sql: "SELECT * FROM workflowEvent WHERE ticketID = ? ORDER BY id", arguments: [ticketID])
+            try Row.fetchAll(
+                db, sql: "SELECT * FROM workflowEvent WHERE ticketID = ? AND attempt = \(Self.currentAttempt) ORDER BY id",
+                arguments: [ticketID, ticketID]
+            )
                 .map { row in
                     WorkflowEvent(
                         id: row["id"],
@@ -292,8 +330,8 @@ public final class AppDatabase: Sendable {
             }
             let approval = Approval(ticketID: ticketID, planHash: planHash, decision: decision, notes: notes, decidedAt: Date())
             try db.execute(
-                sql: "INSERT INTO approval (ticketID, planHash, decision, notes, decidedAt) VALUES (?, ?, ?, ?, ?)",
-                arguments: [ticketID, planHash, decision.rawValue, notes, approval.decidedAt.timeIntervalSince1970]
+                sql: "INSERT INTO approval (ticketID, planHash, decision, notes, decidedAt, attempt) VALUES (?, ?, ?, ?, ?, \(Self.currentAttempt))",
+                arguments: [ticketID, planHash, decision.rawValue, notes, approval.decidedAt.timeIntervalSince1970, ticketID]
             )
             try Self.applyTransition(
                 db, ticketID: ticketID, to: decision.resultingState, kind: .approval,
@@ -370,8 +408,8 @@ public final class AppDatabase: Sendable {
         try await writer.write { db in
             try Self.applyTransition(db, ticketID: ticketID, to: state, kind: .transition, message: message)
             try db.execute(
-                sql: "INSERT INTO agentRun (ticketID, kind, startedAt, logPath) VALUES (?, ?, ?, ?)",
-                arguments: [ticketID, kind.rawValue, Date().timeIntervalSince1970, logPath]
+                sql: "INSERT INTO agentRun (ticketID, kind, startedAt, logPath, attempt) VALUES (?, ?, ?, ?, \(Self.currentAttempt))",
+                arguments: [ticketID, kind.rawValue, Date().timeIntervalSince1970, logPath, ticketID]
             )
             return db.lastInsertedRowID
         }
@@ -426,16 +464,19 @@ public final class AppDatabase: Sendable {
 
     public func runs(ticketID: String) async throws -> [AgentRun] {
         try await writer.read { db in
-            try Row.fetchAll(db, sql: "SELECT * FROM agentRun WHERE ticketID = ? ORDER BY id", arguments: [ticketID]).map { row in
+            try Row.fetchAll(
+                db, sql: "SELECT * FROM agentRun WHERE ticketID = ? AND attempt = \(Self.currentAttempt) ORDER BY id",
+                arguments: [ticketID, ticketID]
+            ).map { row in
                 AgentRun(
                     id: row["id"], ticketID: row["ticketID"], kind: AgentRun.Kind(rawValue: row["kind"]) ?? .investigation,
                     startedAt: Date(timeIntervalSince1970: row["startedAt"]),
                     finishedAt: (row["finishedAt"] as Double?).map(Date.init(timeIntervalSince1970:)),
                     outcome: (row["outcome"] as String?).flatMap(AgentRun.Outcome.init(rawValue:)),
                     numTurns: row["numTurns"], costUSD: row["costUSD"], logPath: row["logPath"], errorMessage: row["errorMessage"],
-                    implementation: (row["reportJSON"] as String?).flatMap {
-                        try? JSONDecoder().decode(ImplementationResult.self, from: Data($0.utf8))
-                    }
+                    implementation: Self.decodeReport(row, kind: .implementation),
+                    validation: Self.decodeReport(row, kind: .validation),
+                    review: Self.decodeReport(row, kind: .review)
                 )
             }
         }
@@ -459,8 +500,8 @@ public final class AppDatabase: Sendable {
                 message: "Implementation of plan v\(plan.version) started"
             )
             try db.execute(
-                sql: "INSERT INTO agentRun (ticketID, kind, startedAt, logPath) VALUES (?, ?, ?, ?)",
-                arguments: [ticketID, AgentRun.Kind.implementation.rawValue, Date().timeIntervalSince1970, logPath]
+                sql: "INSERT INTO agentRun (ticketID, kind, startedAt, logPath, attempt) VALUES (?, ?, ?, ?, \(Self.currentAttempt))",
+                arguments: [ticketID, AgentRun.Kind.implementation.rawValue, Date().timeIntervalSince1970, logPath, ticketID]
             )
             return (db.lastInsertedRowID, plan)
         }
@@ -527,6 +568,113 @@ public final class AppDatabase: Sendable {
         }
     }
 
+    // MARK: - Validation, review and hand-off
+
+    /// Opens a validation or review run. The ticket must already be resting in `state`
+    /// (`validating` or `reviewing`); a second run for the same ticket is refused.
+    public func beginVerificationRun(_ kind: AgentRun.Kind, ticketID: String, in state: WorkflowState, logPath: String) async throws -> Int64 {
+        try await writer.write { db in
+            guard let current = try Self.fetchState(db, ticketID: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
+            guard current == state else { throw WorkflowError.illegalTransition(from: current, to: state) }
+            let open = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM agentRun WHERE ticketID = ? AND finishedAt IS NULL", arguments: [ticketID]) ?? 0
+            guard open == 0 else { throw WorkflowError.illegalTransition(from: current, to: state) }
+            try db.execute(
+                sql: "INSERT INTO agentRun (ticketID, kind, startedAt, logPath, attempt) VALUES (?, ?, ?, ?, \(Self.currentAttempt))",
+                arguments: [ticketID, kind.rawValue, Date().timeIntervalSince1970, logPath, ticketID]
+            )
+            return db.lastInsertedRowID
+        }
+    }
+
+    /// Records validation results. With `thenReview`, moves `validating` → `reviewing`.
+    public func completeValidation(runID: Int64, ticketID: String, result: ValidationResult, thenReview: Bool) async throws {
+        try await writer.write { db in
+            try Self.closeRun(db, runID: runID, outcome: .succeeded, stats: nil, message: nil)
+            try db.execute(sql: "UPDATE agentRun SET reportJSON = ? WHERE id = ?", arguments: [try Self.json(result), runID])
+            let failed = result.failed.count
+            let summary = result.commands.isEmpty ? "No validation commands configured"
+                : failed == 0 ? "All \(result.commands.count) validation command\(result.commands.count == 1 ? "" : "s") passed"
+                : "\(failed) of \(result.commands.count) validation command\(result.commands.count == 1 ? "" : "s") failed"
+            try Self.insertEvent(db, ticketID: ticketID, kind: .transition, from: nil, to: nil, message: summary, at: Date())
+            if thenReview {
+                try Self.applyTransition(db, ticketID: ticketID, to: .reviewing, kind: .transition, message: "Independent review started")
+            }
+        }
+    }
+
+    /// Records the review and hands the ticket to the user.
+    public func completeReview(runID: Int64, ticketID: String, report: ReviewReport, stats: AgentRunStats) async throws {
+        try await writer.write { db in
+            try Self.closeRun(db, runID: runID, outcome: .succeeded, stats: stats, message: nil)
+            try db.execute(sql: "UPDATE agentRun SET reportJSON = ? WHERE id = ?", arguments: [try Self.json(report), runID])
+            let verdict = report.verdict == .approve ? "approved" : "requested changes"
+            try Self.applyTransition(
+                db, ticketID: ticketID, to: .readyForHumanReview, kind: .transition,
+                message: "Review \(verdict) with \(report.findings.count) finding\(report.findings.count == 1 ? "" : "s"). Ready for your review"
+            )
+        }
+    }
+
+    /// Starts a fix of the existing implementation (failing validation, or the user's request
+    /// from the hand-off). The approval of the latest plan must still be valid.
+    public func beginFix(ticketID: String, logPath: String, reason: String) async throws -> (runID: Int64, plan: DecisionDocument) {
+        try await writer.write { db in
+            guard let state = try Self.fetchState(db, ticketID: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
+            guard [.validating, .reviewing, .readyForHumanReview].contains(state) else {
+                throw WorkflowError.implementationBlocked(.wrongState(state))
+            }
+            let plan = try Self.fetchLatestDocument(db, ticketID: ticketID)
+            let verdict = ImplementationGate.evaluate(
+                state: .approved, latestDocument: plan, latestApproval: try Self.fetchLatestApproval(db, ticketID: ticketID)
+            )
+            guard case .allowed = verdict, let plan else {
+                if case .blocked(let reason) = verdict { throw WorkflowError.implementationBlocked(reason) }
+                throw WorkflowError.implementationBlocked(.missingPlan)
+            }
+            try Self.applyTransition(db, ticketID: ticketID, to: .implementing, kind: .transition, message: reason)
+            try db.execute(
+                sql: "INSERT INTO agentRun (ticketID, kind, startedAt, logPath, attempt) VALUES (?, ?, ?, ?, \(Self.currentAttempt))",
+                arguments: [ticketID, AgentRun.Kind.implementation.rawValue, Date().timeIntervalSince1970, logPath, ticketID]
+            )
+            return (db.lastInsertedRowID, plan)
+        }
+    }
+
+    /// Back to `selected` from any resting state with a clean slate: the worktree record is
+    /// forgotten and a new attempt begins, so earlier plans, approvals, runs and history are no
+    /// longer shown or given to the next investigation. They stay in the database as an audit
+    /// trail. Not allowed while anything runs or once the ticket is done.
+    public func startOver(ticketID: String) async throws {
+        try await writer.write { db in
+            guard let state = try Self.fetchState(db, ticketID: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
+            let openRuns = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM agentRun WHERE ticketID = ? AND finishedAt IS NULL", arguments: [ticketID]) ?? 0
+            guard !state.isAgentRunning, openRuns == 0, state != .completeManual, state != .discovered else {
+                throw WorkflowError.illegalTransition(from: state, to: .selected)
+            }
+            try db.execute(sql: "DELETE FROM ticketWorkspace WHERE ticketID = ?", arguments: [ticketID])
+            // The way back is recorded in the attempt being closed.
+            if state != .selected {
+                if !state.canTransition(to: .selected) {
+                    try Self.applyTransition(db, ticketID: ticketID, to: .cancelled, kind: .transition, message: "Started over by user")
+                }
+                try Self.applyTransition(db, ticketID: ticketID, to: .selected, kind: .transition, message: "Started over by user")
+            }
+            try db.execute(sql: "UPDATE ticketWorkflow SET attempt = attempt + 1 WHERE ticketID = ?", arguments: [ticketID])
+            let attempt = try Int.fetchOne(db, sql: "SELECT attempt FROM ticketWorkflow WHERE ticketID = ?", arguments: [ticketID]) ?? 0
+            try Self.insertEvent(
+                db, ticketID: ticketID, kind: .transition, from: nil, to: .selected,
+                message: "Started over (attempt \(attempt)): fresh worktree, no earlier plans or answers", at: Date()
+            )
+        }
+    }
+
+    /// The user has reviewed and committed the work.
+    public func markDone(ticketID: String) async throws {
+        try await writer.write { db in
+            try Self.applyTransition(db, ticketID: ticketID, to: .completeManual, kind: .transition, message: "Marked done by user")
+        }
+    }
+
     /// Records the user's answers to clarifying questions for the next investigation.
     public func recordClarification(ticketID: String, answers: String) async throws {
         try await writer.write { db in
@@ -542,12 +690,12 @@ public final class AppDatabase: Sendable {
             try String.fetchAll(db, sql: """
                 SELECT text FROM (
                     SELECT 'Answers to clarifying questions: ' || message AS text, createdAt AS at
-                    FROM workflowEvent WHERE ticketID = ? AND kind = 'clarification'
+                    FROM workflowEvent WHERE ticketID = ? AND kind = 'clarification' AND attempt = \(Self.currentAttempt)
                     UNION ALL
                     SELECT 'Revision requested: ' || notes AS text, decidedAt AS at
-                    FROM approval WHERE ticketID = ? AND decision = ? AND notes != ''
+                    FROM approval WHERE ticketID = ? AND decision = ? AND notes != '' AND attempt = \(Self.currentAttempt)
                 ) ORDER BY at
-                """, arguments: [ticketID, ticketID, ApprovalDecision.revisionRequested.rawValue])
+                """, arguments: [ticketID, ticketID, ticketID, ApprovalDecision.revisionRequested.rawValue, ticketID])
         }
     }
 
@@ -564,22 +712,28 @@ public final class AppDatabase: Sendable {
         guard let state = try fetchState(db, ticketID: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
         guard state == .investigating else { throw WorkflowError.decisionDocumentNotAllowed(in: state) }
         let version = (try Int.fetchOne(
-            db, sql: "SELECT MAX(version) FROM decisionDocument WHERE ticketID = ?", arguments: [ticketID]
+            db, sql: "SELECT MAX(version) FROM decisionDocument WHERE ticketID = ? AND attempt = \(currentAttempt)",
+            arguments: [ticketID, ticketID]
         ) ?? 0) + 1
         let document = DecisionDocument(
             ticketID: ticketID, version: version, markdown: markdown, createdAt: Date(), investigation: investigation
         )
         try db.execute(
             sql: """
-                INSERT INTO decisionDocument (ticketID, version, markdown, contentHash, createdAt, investigationJSON)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO decisionDocument (ticketID, version, markdown, contentHash, createdAt, investigationJSON, attempt)
+                VALUES (?, ?, ?, ?, ?, ?, \(currentAttempt))
                 """,
             arguments: [
                 ticketID, version, markdown, document.contentHash, document.createdAt.timeIntervalSince1970,
-                try investigation.map(json),
+                try investigation.map(json), ticketID,
             ]
         )
         return document
+    }
+
+    private static func decodeReport<T: Decodable>(_ row: Row, kind: AgentRun.Kind) -> T? {
+        guard (row["kind"] as String?) == kind.rawValue, let json = row["reportJSON"] as String? else { return nil }
+        return try? JSONDecoder().decode(T.self, from: Data(json.utf8))
     }
 
     private static func closeRun(_ db: Database, runID: Int64, outcome: AgentRun.Outcome, stats: AgentRunStats?, message: String?) throws {
@@ -619,8 +773,11 @@ public final class AppDatabase: Sendable {
         at date: Date
     ) throws {
         try db.execute(
-            sql: "INSERT INTO workflowEvent (ticketID, kind, fromState, toState, message, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
-            arguments: [ticketID, kind.rawValue, from?.rawValue, to?.rawValue, message, date.timeIntervalSince1970]
+            sql: """
+                INSERT INTO workflowEvent (ticketID, kind, fromState, toState, message, createdAt, attempt)
+                VALUES (?, ?, ?, ?, ?, ?, \(currentAttempt))
+                """,
+            arguments: [ticketID, kind.rawValue, from?.rawValue, to?.rawValue, message, date.timeIntervalSince1970, ticketID]
         )
     }
 
@@ -631,7 +788,8 @@ public final class AppDatabase: Sendable {
 
     private static func fetchLatestDocument(_ db: Database, ticketID: String) throws -> DecisionDocument? {
         try Row.fetchOne(
-            db, sql: "SELECT * FROM decisionDocument WHERE ticketID = ? ORDER BY version DESC LIMIT 1", arguments: [ticketID]
+            db, sql: "SELECT * FROM decisionDocument WHERE ticketID = ? AND attempt = \(currentAttempt) ORDER BY version DESC LIMIT 1",
+            arguments: [ticketID, ticketID]
         ).map { row in
             DecisionDocument(
                 ticketID: row["ticketID"], version: row["version"], markdown: row["markdown"],
@@ -645,7 +803,8 @@ public final class AppDatabase: Sendable {
 
     private static func fetchLatestApproval(_ db: Database, ticketID: String) throws -> Approval? {
         try Row.fetchOne(
-            db, sql: "SELECT * FROM approval WHERE ticketID = ? ORDER BY id DESC LIMIT 1", arguments: [ticketID]
+            db, sql: "SELECT * FROM approval WHERE ticketID = ? AND attempt = \(currentAttempt) ORDER BY id DESC LIMIT 1",
+            arguments: [ticketID, ticketID]
         ).map { row in
             Approval(
                 ticketID: row["ticketID"], planHash: row["planHash"],

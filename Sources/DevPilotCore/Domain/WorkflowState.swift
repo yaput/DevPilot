@@ -35,7 +35,8 @@ public enum WorkflowState: String, Codable, Sendable, CaseIterable {
         // `implementing` from validating/reviewing is the bounded fix-retry loop.
         case .validating: [.reviewing, .implementing, .failed, .cancelled]
         case .reviewing: [.readyForHumanReview, .implementing, .failed, .cancelled]
-        case .readyForHumanReview: [.completeManual, .cancelled]
+        // From the hand-off the user can ask for a fix or re-run tests and review.
+        case .readyForHumanReview: [.completeManual, .implementing, .validating, .cancelled]
         case .completeManual: []
         // Restarting goes back through investigation and a fresh approval. Returning to
         // `approved` (to retry implementation) is only offered through

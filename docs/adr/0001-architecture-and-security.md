@@ -101,6 +101,27 @@ the model's own report:
   - Reads of `~/.zshrc` and `~/.ssh` were denied; `ANTHROPIC_API_KEY` was absent from commands'
     environment.
   - `npm test`, `pnpm test`, `javac` and `java` worked inside the sandbox.
+- **Validation commands run agent-written code**, so DevPilot runs them in its own macOS sandbox
+  (`/usr/bin/sandbox-exec` with a generated profile), not outside it: `(deny network*)` with
+  separate bind/inbound/outbound allowances for localhost only, writes limited to the worktree,
+  temp folders and build caches, `.git` metadata write-denied, secret paths read-denied. Verified
+  with real runs: writes outside, `git commit`, rewriting `.git`, and `curl` fail; localhost
+  servers and `javac`/`java`/npm work. Note: a single `(allow network* (local ip "localhost:*"))`
+  rule *also permits outbound internet connections*; the profile avoids that form and a test
+  asserts it. Unix sockets are allowed only under the temp folders (JVM attach, needed by Mockito)
+  and for macOS's DNS service: an unrestricted unix-socket rule would let test code reach e.g.
+  Docker's socket, a way out of the sandbox. Claude Code's `allowUnixSockets` cannot express this
+  (attach sockets have per-process names), so its sandbox keeps Unix sockets blocked and the
+  implementer is told that such tests only run during validation.
+- **Start Over** begins a new *attempt*: every history row (events, runs, plans, approvals) carries
+  the attempt it belongs to, and all queries read only the current one, so the approval gate,
+  plan versions and investigation context start fresh. Earlier attempts are kept, not deleted,
+  to preserve the audit trail; their files in the artifacts folder are deleted.
+- Gradle runs with `GRADLE_OPTS=-Dorg.gradle.daemon=false`: daemons detach from their parent and
+  would otherwise outlive the run.
+- **The review is a separate, read-only session** that sees the diff, the plan, the validation
+  results and the implementer's report (marked unverified). Automatic fixes are bounded by a
+  user setting; failing validation is recorded, shown at hand-off and passed to the reviewer.
 - Setup commands (dependency installation) are configured by the user and run by DevPilot via
   `/bin/sh -c`, with network access, outside the agent sandbox. That is equivalent to the user
   running them in a terminal.

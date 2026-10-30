@@ -35,11 +35,14 @@ public struct ImplementationRequest: Sendable {
     public let commonGitDirectory: String
     public let tools: ToolEnvironment
     public let logURL: URL
+    /// Set for a fix of an existing implementation: what to fix (failing tests, review findings).
+    public let fixInstructions: String?
     public let onLaunch: (@Sendable (pid_t) -> Void)?
 
     public init(
         ticket: Ticket, workspace: TicketWorkspace, plan: DecisionDocument, allowedCommands: [String],
-        commonGitDirectory: String, tools: ToolEnvironment, logURL: URL, onLaunch: (@Sendable (pid_t) -> Void)? = nil
+        commonGitDirectory: String, tools: ToolEnvironment, logURL: URL, fixInstructions: String? = nil,
+        onLaunch: (@Sendable (pid_t) -> Void)? = nil
     ) {
         self.ticket = ticket
         self.workspace = workspace
@@ -47,6 +50,37 @@ public struct ImplementationRequest: Sendable {
         self.allowedCommands = allowedCommands
         self.commonGitDirectory = commonGitDirectory
         self.tools = tools
+        self.logURL = logURL
+        self.fixInstructions = fixInstructions
+        self.onLaunch = onLaunch
+    }
+}
+
+public struct ReviewRequest: Sendable {
+    public let ticket: Ticket
+    public let workspace: TicketWorkspace
+    public let plan: DecisionDocument
+    /// The implementer's own account, to be checked rather than trusted.
+    public let implementation: ImplementationReport?
+    public let validation: ValidationResult
+    /// `git diff` of the worktree against its base (truncated if very large).
+    public let diff: String
+    public let commonGitDirectory: String
+    public let logURL: URL
+    public let onLaunch: (@Sendable (pid_t) -> Void)?
+
+    public init(
+        ticket: Ticket, workspace: TicketWorkspace, plan: DecisionDocument, implementation: ImplementationReport?,
+        validation: ValidationResult, diff: String, commonGitDirectory: String, logURL: URL,
+        onLaunch: (@Sendable (pid_t) -> Void)? = nil
+    ) {
+        self.ticket = ticket
+        self.workspace = workspace
+        self.plan = plan
+        self.implementation = implementation
+        self.validation = validation
+        self.diff = diff
+        self.commonGitDirectory = commonGitDirectory
         self.logURL = logURL
         self.onLaunch = onLaunch
     }
@@ -65,6 +99,12 @@ public protocol AgentRunner: Sendable {
         _ request: ImplementationRequest,
         onProgress: @escaping @Sendable (String) -> Void
     ) async throws -> (ImplementationReport, AgentRunStats)
+
+    /// A fresh, read-only session that checks the implementation against the approved plan.
+    func review(
+        _ request: ReviewRequest,
+        onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> (ReviewReport, AgentRunStats)
 }
 
 public enum AgentError: Error, Equatable, LocalizedError {
@@ -98,6 +138,10 @@ public struct UnavailableAgentRunner: AgentRunner {
     }
 
     public func implement(_ request: ImplementationRequest, onProgress: @escaping @Sendable (String) -> Void) async throws -> (ImplementationReport, AgentRunStats) {
+        throw AgentError.notConfigured(reason)
+    }
+
+    public func review(_ request: ReviewRequest, onProgress: @escaping @Sendable (String) -> Void) async throws -> (ReviewReport, AgentRunStats) {
         throw AgentError.notConfigured(reason)
     }
 }

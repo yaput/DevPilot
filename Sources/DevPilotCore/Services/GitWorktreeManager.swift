@@ -49,8 +49,8 @@ public struct GitWorktreeManager: Sendable {
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw WorkspaceError.repositoryMissing(path)
         }
-        guard let topLevel = try? await run(["rev-parse", "--show-toplevel"], in: url) else {
-            if (try? await run(["rev-parse", "--is-bare-repository"], in: url)) == "true" {
+        guard let topLevel = try await output(["rev-parse", "--show-toplevel"], in: url) else {
+            if (try await output(["rev-parse", "--is-bare-repository"], in: url)) == "true" {
                 throw WorkspaceError.bareRepository(path)
             }
             throw WorkspaceError.notAGitRepository(path)
@@ -58,12 +58,12 @@ public struct GitWorktreeManager: Sendable {
         guard Self.realPath(topLevel) == Self.realPath(url.path) else {
             throw WorkspaceError.notRepositoryRoot(path: path, root: topLevel)
         }
-        var defaultBranch = try? await run(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], in: url)
+        var defaultBranch = try await output(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], in: url)
         if let remote = defaultBranch, remote.hasPrefix("origin/") {
             defaultBranch = String(remote.dropFirst("origin/".count))
         }
         if defaultBranch?.isEmpty ?? true {
-            defaultBranch = try? await run(["branch", "--show-current"], in: url)
+            defaultBranch = try await output(["branch", "--show-current"], in: url)
         }
         return RepositoryInspection(topLevel: topLevel, defaultBranch: defaultBranch?.isEmpty == false ? defaultBranch : nil)
     }
@@ -83,7 +83,7 @@ public struct GitWorktreeManager: Sendable {
 
         let base = (baseBranch ?? repository.baseBranch).trimmingCharacters(in: .whitespaces)
         guard !base.isEmpty, !base.hasPrefix("-") else { throw WorkspaceError.invalidRef(base) }
-        guard let baseCommit = try? await run(["rev-parse", "--verify", "--quiet", "\(base)^{commit}"], in: repoURL) else {
+        guard let baseCommit = try await output(["rev-parse", "--verify", "--quiet", "\(base)^{commit}"], in: repoURL) else {
             throw WorkspaceError.baseBranchMissing(base)
         }
 
@@ -98,9 +98,9 @@ public struct GitWorktreeManager: Sendable {
             let branch = branchBase + suffix
             let path = repoDirectory.appending(path: name + suffix, directoryHint: .isDirectory)
             if FileManager.default.fileExists(atPath: path.path) { continue }
-            if (try? await run(["rev-parse", "--verify", "--quiet", "refs/heads/\(branch)"], in: repoURL)) != nil { continue }
+            if (try await output(["rev-parse", "--verify", "--quiet", "refs/heads/\(branch)"], in: repoURL)) != nil { continue }
 
-            guard (try? await run(["check-ref-format", "--branch", branch], in: repoURL)) != nil else {
+            guard (try await output(["check-ref-format", "--branch", branch], in: repoURL)) != nil else {
                 throw WorkspaceError.invalidRef(branch)
             }
             guard Self.realPath(repoDirectory.path).hasPrefix(rootReal + "/") else {
@@ -135,19 +135,19 @@ public struct GitWorktreeManager: Sendable {
         return "\(prefix)/\(id)"
     }
 
-    /// Removes a ticket's worktree with plain `git worktree remove`, which refuses if it has
-    /// uncommitted or untracked changes. The branch is deleted with `git branch -d`, which
-    /// refuses if it has commits not merged anywhere; then it is kept. Returns whether the
-    /// branch was deleted.
+    /// Removes a ticket's worktree with `git worktree remove`, which refuses if it has
+    /// uncommitted or untracked changes, unless `discardingChanges` (the user confirmed losing
+    /// them). The branch is deleted with `git branch -d`, which refuses if it has commits not
+    /// merged anywhere; then it is kept. Returns whether the branch was deleted.
     @discardableResult
-    public func removeWorktree(_ workspace: TicketWorkspace) async throws -> Bool {
+    public func removeWorktree(_ workspace: TicketWorkspace, discardingChanges: Bool = false) async throws -> Bool {
         let repository = URL(filePath: workspace.repositoryPath, directoryHint: .isDirectory)
         if FileManager.default.fileExists(atPath: workspace.worktreePath) {
-            _ = try await run(["worktree", "remove", workspace.worktreePath], in: repository)
+            _ = try await run(["worktree", "remove"] + (discardingChanges ? ["--force"] : []) + [workspace.worktreePath], in: repository)
         } else {
-            _ = try? await run(["worktree", "prune"], in: repository)
+            _ = try await output(["worktree", "prune"], in: repository)
         }
-        return (try? await run(["branch", "-d", workspace.branch], in: repository)) != nil
+        return (try await output(["branch", "-d", workspace.branch], in: repository)) != nil
     }
 
     public struct Branch: Sendable, Hashable, Identifiable {
@@ -227,6 +227,18 @@ public struct GitWorktreeManager: Sendable {
     }
 
     // MARK: - Helpers
+
+    /// Like `run`, but a failing git command yields nil. Cancellation still propagates, so a
+    /// stopped run is never mistaken for a git "no" (e.g. "not a valid branch name").
+    func output(_ arguments: [String], in directory: URL) async throws -> String? {
+        do {
+            return try await run(arguments, in: directory)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return nil
+        }
+    }
 
     @discardableResult
     func run(_ arguments: [String], in directory: URL, trimming: Bool = true) async throws -> String {

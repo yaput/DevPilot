@@ -146,21 +146,69 @@ extension GitWorktreeManager {
     /// Everything that differs from `base` in the worktree: committed and uncommitted changes to
     /// tracked files, plus new untracked files (ignored files excluded). Read-only.
     public func diff(in worktree: String, against base: String) async throws -> [FileDiff] {
+        let (tracked, untracked) = try await diffText(in: worktree, against: base)
+        let files = UnifiedDiffParser.parse(tracked) + untracked.flatMap { UnifiedDiffParser.parse($0).map { $0.with(change: .untracked) } }
+        return files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+    }
+
+    /// The same changes as one unified diff, e.g. for a reviewer.
+    public func unifiedDiff(in worktree: String, against base: String) async throws -> String {
+        let (tracked, untracked) = try await diffText(in: worktree, against: base)
+        return ([tracked] + untracked).joined(separator: tracked.hasSuffix("\n") || tracked.isEmpty ? "" : "\n")
+    }
+
+    private func diffText(in worktree: String, against base: String) async throws -> (tracked: String, untracked: [String]) {
         let directory = URL(filePath: worktree, directoryHint: .isDirectory)
         let options = ["-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "-M", "--src-prefix=a/", "--dst-prefix=b/"]
-        var files = UnifiedDiffParser.parse(try await run(options + [base, "--"], in: directory, trimming: false))
+        let tracked = try await run(options + [base, "--"], in: directory, trimming: false)
 
-        let untracked = try await run(["ls-files", "--others", "--exclude-standard", "-z"], in: directory, trimming: false)
+        var untracked: [String] = []
+        let paths = try await run(["ls-files", "--others", "--exclude-standard", "-z"], in: directory, trimming: false)
             .split(separator: "\0").map(String.init)
-        for path in untracked.prefix(Self.maxUntrackedFilesInDiff) {
+        for path in paths.prefix(Self.maxUntrackedFilesInDiff) {
             // `--no-index` exits 1 when the files differ, which is always the case here.
             let result = try await ProcessRunner.run(ProcessRequest(
                 executable: git, arguments: options + ["--no-index", "--", "/dev/null", path],
                 workingDirectory: directory, environment: Self.environment(), timeout: .seconds(60)
             ))
             guard result.termination == .exited(1) || result.termination == .exited(0) else { continue }
-            files += UnifiedDiffParser.parse(result.stdoutText).map { $0.with(change: .untracked) }
+            untracked.append(result.stdoutText)
         }
-        return files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        return (tracked, untracked)
+    }
+
+    /// Commits on the ticket's branch and whether they are pushed. Read-only; reflects the
+    /// remote-tracking refs as of the last push or fetch.
+    public func branchStatus(_ workspace: TicketWorkspace) async -> BranchStatus? {
+        let repository = URL(filePath: workspace.repositoryPath, directoryHint: .isDirectory)
+        let local = "refs/heads/\(workspace.branch)"
+        guard let commits = try? await run(["rev-list", "--count", "\(workspace.baseCommit)..\(local)"], in: repository) else {
+            return nil
+        }
+        let remote = await remoteBranch(for: workspace.branch, in: repository)
+        let unpushed = if let remote {
+            Int((try? await run(["rev-list", "--count", "\(remote)..\(local)"], in: repository)) ?? "") ?? 0
+        } else {
+            Int(commits) ?? 0
+        }
+        let uncommitted: Int? = FileManager.default.fileExists(atPath: workspace.worktreePath)
+            ? (try? await changedFiles(in: workspace.worktreePath))?.count : nil
+        return BranchStatus(
+            branch: workspace.branch, commitsSinceBase: Int(commits) ?? 0, upstream: remote,
+            unpushedCommits: unpushed, uncommittedFiles: uncommitted
+        )
+    }
+
+    /// The configured upstream (`git push -u`), or else a remote branch of the same name
+    /// (`git push origin <branch>` without `-u` sets no upstream). Nil if neither exists.
+    func remoteBranch(for branch: String, in repository: URL) async -> String? {
+        // `<branch>@{upstream}` takes a branch name, not a full ref.
+        if let upstream = try? await run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "\(branch)@{upstream}"], in: repository),
+           !upstream.isEmpty {
+            return upstream
+        }
+        let sameName = (try? await run(["for-each-ref", "--format=%(refname:short)", "refs/remotes/*/\(branch)"], in: repository)) ?? ""
+        let candidates = sameName.split(separator: "\n").map(String.init)
+        return candidates.first { $0.hasPrefix("origin/") } ?? candidates.first
     }
 }

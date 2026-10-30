@@ -67,6 +67,16 @@ struct GitWorktreeManagerTests {
         #expect(workspace.worktreePath.hasPrefix(repo.worktrees.path))
     }
 
+    @Test func cancellationIsNotMistakenForAGitAnswer() async throws {
+        let repo = try await TestRepository()
+        defer { repo.remove() }
+        let manager = repo.manager
+        let config = repo.config
+        let task = Task { try await manager.prepareWorktree(for: ticket("PLAT-5"), repository: config) }
+        task.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await task.value }
+    }
+
     @Test func repositoryHooksDoNotRun() async throws {
         let repo = try await TestRepository()
         defer { repo.remove() }

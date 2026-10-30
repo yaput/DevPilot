@@ -38,10 +38,14 @@ public final class ImplementationService: Sendable {
 
     /// Starts from `approved`. Runs the repository's enabled setup commands, then the agent,
     /// then verifies no commits were made and moves the ticket to `validating`.
+    ///
+    /// With `fixInstructions`, fixes the existing implementation instead (from `validating`,
+    /// `reviewing` or `ready_for_human_review`); setup is skipped because it already ran.
     public func implement(
         ticketID: String,
         repository: RepositoryConfig,
         tools: ToolEnvironment,
+        fixInstructions: String? = nil,
         onEvent: @escaping @Sendable (RunEvent) -> Void
     ) async throws -> ImplementationResult {
         guard let ticket = try await database.ticket(id: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
@@ -52,13 +56,20 @@ public final class ImplementationService: Sendable {
             throw ImplementationError.worktreeMissing(workspace.worktreePath)
         }
         let logURL = artifacts.runLogURL(ticketID: ticketID, kind: .implementation, at: Date())
-        let (runID, plan) = try await database.beginImplementation(ticketID: ticketID, logPath: logURL.path)
+        let (runID, plan) = if let fixInstructions {
+            try await database.beginFix(
+                ticketID: ticketID, logPath: logURL.path,
+                reason: "Fix started: " + String(fixInstructions.prefix(200)).replacingOccurrences(of: "\n", with: " ")
+            )
+        } else {
+            try await database.beginImplementation(ticketID: ticketID, logPath: logURL.path)
+        }
         onEvent(.started)
 
         do {
             let headBefore = try await worktrees.head(of: workspace.worktreePath)
             let setupLog = logURL.deletingPathExtension().appendingPathExtension("setup.log")
-            for rule in repository.setupCommands where rule.isEnabled {
+            for rule in repository.setupCommands where rule.isEnabled && fixInstructions == nil {
                 onEvent(.progress("Setup: \(rule.command)"))
                 try await runSetup(rule.command, in: workspace.worktreePath, tools: tools, log: setupLog)
             }
@@ -71,6 +82,7 @@ public final class ImplementationService: Sendable {
                 commonGitDirectory: try await worktrees.commonGitDirectory(of: workspace.worktreePath),
                 tools: tools,
                 logURL: logURL,
+                fixInstructions: fixInstructions,
                 onLaunch: { [database] group in
                     Task { try? await database.recordProcessGroup(runID: runID, processGroup: group) }
                 }

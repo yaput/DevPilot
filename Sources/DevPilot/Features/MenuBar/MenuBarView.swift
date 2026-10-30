@@ -8,6 +8,7 @@ struct MenuBarView: View {
     var body: some View {
         Text(model.runningCount == 0 ? "Idle" : "\(model.runningCount) run(s) in progress")
         Text(model.pendingApprovalCount == 1 ? "1 plan awaiting approval" : "\(model.pendingApprovalCount) plans awaiting approval")
+        Text(model.readyForReviewCount == 1 ? "1 ticket ready for your review" : "\(model.readyForReviewCount) tickets ready for your review")
         Divider()
         Button("Open Dashboard") {
             openWindow(id: AppWindow.dashboard)

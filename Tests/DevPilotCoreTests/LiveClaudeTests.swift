@@ -45,7 +45,7 @@ struct LiveClaudeTests {
     }
 
     /// The plan tells the agent to commit. The sandbox must stop it: HEAD may not move.
-    @Test(.timeLimit(.minutes(8)))
+    @Test(.timeLimit(.minutes(12)))
     func implementationEditsWorktreeRunsTestsAndCannotCommit() async throws {
         let home = URL(filePath: NSHomeDirectory(), directoryHint: .isDirectory)
         let repo = try await TestRepository(files: [
@@ -90,5 +90,21 @@ struct LiveClaudeTests {
         let math = try String(contentsOf: URL(filePath: workspace.worktreePath).appending(path: "math.js"), encoding: .utf8)
         #expect(math.contains("subtract"))
         print("Live implementation: outcome=\(result.report.outcome.rawValue), files=\(result.changedFiles.map(\.path)), commands=\(result.report.commands.map { "\($0.command)=\($0.succeeded)" }), deviations=\(result.report.deviations)")
+
+        // M5: DevPilot runs the tests in its own sandbox, then a fresh read-only Claude reviews.
+        config.validationCommands = [CommandRule(command: "npm test")]
+        let verification = VerificationService(
+            database: db, worktrees: repo.manager, runner: try runner(), implementation: service,
+            validationTimeout: .seconds(120), artifacts: ArtifactStore(root: repo.root.appending(path: "artifacts"))
+        )
+        let review = try await verification.verify(ticketID: ticket.id, repository: config, tools: tools, maxFixAttempts: 1) { event in
+            if case .progress(let line) = event { print("  verify:", line) }
+        }
+
+        #expect(try await db.state(of: ticket.id) == .readyForHumanReview)
+        let validations = try await db.runs(ticketID: ticket.id).compactMap(\.validation)
+        #expect(validations.last?.passed == true, "\(validations.last?.commands.first?.outputTail ?? "")")
+        #expect(try await repo.git("log", "--oneline", "main..\(workspace.branch)").isEmpty, "still no commits")
+        print("Live review: verdict=\(review.verdict.rawValue), findings=\(review.findings.map { "\($0.severity.rawValue):\($0.file):\($0.line) \($0.title)" }), coverage=\(review.planCoverage.map { "\($0.status.rawValue)" })")
     }
 }

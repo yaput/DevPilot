@@ -21,7 +21,7 @@ struct ChangesView: View {
             .overlay {
                 if files.isEmpty && !isLoading {
                     ContentUnavailableView(error == nil ? "No changes" : "Could not load changes", systemImage: "doc.text.magnifyingglass",
-                                           description: Text(error ?? "The worktree matches its base commit."))
+                                           description: Text(error ?? emptyExplanation))
                 }
             }
             .safeAreaInset(edge: .bottom) { summary }
@@ -58,6 +58,15 @@ struct ChangesView: View {
             }
         }
         .task { await load() }
+    }
+
+    private var emptyExplanation: String {
+        switch model.state(of: ticketID) {
+        case .selected, .investigating, .needsClarification, .planReady, .awaitingPlanApproval, .needsRevision, .approved:
+            "Nothing has been implemented yet: investigation only reads the code. Approve the plan and click Implement."
+        default:
+            "The worktree matches its base commit."
+        }
     }
 
     private var title: String {

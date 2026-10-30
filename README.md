@@ -15,7 +15,7 @@ DevPilot never commits, pushes, deploys or opens PRs. See
 | M2 | Shortcut and Jira Cloud adapters, configurable URLs, Keychain credentials | Done |
 | M3 | Repo mapping, worktrees, read-only Claude Code investigation, decision record, approval | Done |
 | M4 | Sandboxed implementation in the worktree, per-repo commands, integration branch names | Done |
-| M5 | Test runner, independent review, diff viewer, notifications, worktree cleanup | Next |
+| M5 | Sandboxed validation, automatic fix loop, independent review, hand-off, diff viewer, notifications, cleanup | Done |
 
 ## Requirements
 
@@ -116,8 +116,45 @@ On an approved ticket, **Implement** does the following:
 4. Verifies HEAD did not move, lists the changed files, and moves the ticket to *Validating* with
    Claude's report (what was done, commands run, deviations, remaining work).
 
-You then review the changes in your IDE and commit them yourself. If a run fails or you stop it,
-**Retry Implementation** goes back to the approved plan; **Restart** starts over from investigation.
+If a run fails or you stop it, **Retry Implementation** goes back to the approved plan.
+**Start Over…** (any resting state) gives the ticket a clean slate: the worktree is removed
+(including uncommitted changes, after you confirm; a branch with commits is kept), its transcripts,
+logs, decision records and reviews are deleted, and earlier plans, answers, runs and history are
+neither shown nor given to the next investigation, which starts again at plan v1. The database
+keeps earlier attempts as an audit trail.
+
+JVM tests that attach an agent at runtime (Mockito inline mocks) cannot run inside Claude's
+sandbox during implementation; Claude is told so and compiles them instead. They do run in
+DevPilot's validation sandbox afterwards, which allows Unix sockets in temp folders only.
+
+## Tests, review and hand-off (M5)
+
+After implementation, in the same run:
+1. **Validation:** DevPilot runs the repository's checked *validation commands* (tests, lint,
+   typecheck) in the worktree inside a macOS sandbox (`sandbox-exec`): no internet (localhost
+   works), writes only in the worktree, temp folders and build caches, git metadata read-only,
+   credential stores and shell profiles unreadable. Each command must exit 0; full logs are kept.
+2. **Automatic fix:** if a command fails, Claude gets the failing output and fixes the code, then
+   validation runs again, up to *Automatic fix attempts* times (Settings → Agent, default 1).
+   Tests are never skipped: if they still fail, that is shown at hand-off and given to the reviewer.
+3. **Independent review:** a fresh, read-only Claude session compares the actual diff with the
+   approved plan and the test results, and reports findings with severity and file:line, plan
+   coverage and unresolved risks. Saved as `review-*.md` in the artifacts folder.
+4. **Ready for your review:** a notification, then the hand-off panel: test results with logs,
+   the review (click a finding's `file:line` to open it in IntelliJ/VS Code at that line),
+   **View Changes**, **Fix with Claude…** (pick failing tests and findings, add your own notes),
+   **Run Tests & Review Again**, and **Mark as Done…**.
+
+**Mark as Done** shows whether the branch has commits and whether they are pushed, and offers to
+remove the worktree. Git refuses if anything is uncommitted; the branch is kept unless fully
+merged or pushed. You still commit, push and open the PR yourself.
+
+Validation commands are detected per project: Gradle/Maven `test` (offline: dependencies must be
+cached by the setup command) and the `typecheck`, `lint` and `test` scripts found in package.json.
+Edit them in Settings → Repositories → *Configure Commands…*.
+
+Notifications: plan ready, clarification needed, ready for review, failed. Clicking one selects
+the ticket.
 
 **Per-repository commands:** Settings → Repositories → *Configure Commands…*. Detected
 automatically from build files (top level and up to two folders down, for monorepos): Maven,
@@ -194,10 +231,12 @@ scripts/build-app.sh       bundle + sign
 - Worktrees branch from the *local* base branch. Pull it first if you want the latest code.
 - After a crash, leftover Claude processes are stopped on the next launch (matched by process
   group *and* command, so an unrelated program can never be killed).
-- Maven and Gradle builds inside the sandbox have not been verified against a real project yet.
-  npm, pnpm, `javac`/`java` have. If a Gradle/Maven command fails with a sandbox violation, the
-  transcript shows which path or connection was denied.
+- Maven and Gradle builds inside the sandboxes have not been verified against a real project yet.
+  npm, pnpm, `javac`/`java` and localhost servers have. Gradle validation runs `--offline`; if a
+  test-runtime dependency was not cached by the setup command, the log says so. Run the full
+  `./gradlew test` once as a setup command to cache everything.
 - Command rules match the start of a command (`pnpm` allows `pnpm anything`). Publishing and
   deploying are blocked by the deny list and, regardless of wording, by the network being off.
-- M5: running the approved tests independently, a separate read-only review, diff viewer,
-  notifications, worktree cleanup when a ticket is done.
+- Not built (by choice so far): moving tickets to "In Review" in Jira/Shortcut (branch names let
+  your tracker integrations do it), fetching the base branch automatically, session reuse for
+  faster revisions.

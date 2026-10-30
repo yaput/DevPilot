@@ -103,6 +103,8 @@ public struct AgentRun: Sendable, Hashable, Identifiable {
     public enum Kind: String, Codable, Sendable {
         case investigation
         case implementation
+        /// Test/lint/typecheck commands run by DevPilot (not an agent) in the sandbox.
+        case validation
         case review
     }
 
@@ -126,11 +128,15 @@ public struct AgentRun: Sendable, Hashable, Identifiable {
     public let errorMessage: String?
     /// Set for implementation runs that finished.
     public let implementation: ImplementationResult?
+    /// Set for validation runs that finished.
+    public let validation: ValidationResult?
+    /// Set for review runs that finished.
+    public let review: ReviewReport?
 
     public init(
         id: Int64, ticketID: String, kind: Kind, startedAt: Date, finishedAt: Date?, outcome: Outcome?,
         numTurns: Int?, costUSD: Double?, logPath: String, errorMessage: String?,
-        implementation: ImplementationResult? = nil
+        implementation: ImplementationResult? = nil, validation: ValidationResult? = nil, review: ReviewReport? = nil
     ) {
         self.id = id
         self.ticketID = ticketID
@@ -143,6 +149,8 @@ public struct AgentRun: Sendable, Hashable, Identifiable {
         self.logPath = logPath
         self.errorMessage = errorMessage
         self.implementation = implementation
+        self.validation = validation
+        self.review = review
     }
 }
 

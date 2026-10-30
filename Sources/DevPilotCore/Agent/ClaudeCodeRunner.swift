@@ -91,6 +91,40 @@ public struct ClaudeCodeRunner: AgentRunner {
             + ["--settings", sandbox]
     }
 
+    // MARK: - Review
+
+    public func review(
+        _ request: ReviewRequest,
+        onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> (ReviewReport, AgentRunStats) {
+        try await run(
+            arguments: reviewArguments(request),
+            prompt: ReviewPrompt.render(request),
+            worktree: request.workspace.worktreePath,
+            environment: Self.environment(),
+            timeout: investigationTimeout,
+            logURL: request.logURL,
+            onLaunch: request.onLaunch,
+            onProgress: onProgress
+        )
+    }
+
+    /// Read-only: file tools scoped to the worktree, plus read-only git commands in the sandbox.
+    func reviewArguments(_ request: ReviewRequest) -> [String] {
+        let worktree = request.workspace.worktreePath
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        let sandbox = SandboxPolicy.settingsJSON(
+            worktree: GitWorktreeManager.realPath(worktree),
+            commonGitDirectory: GitWorktreeManager.realPath(request.commonGitDirectory),
+            home: home
+        )
+        return common(schema: ReviewPrompt.schema, policy: ReviewPrompt.policy)
+            + ["--tools", "Read,Grep,Glob,Bash"]
+            + ["--allowedTools", Self.within("Read", worktree)] + (CommandPresets.gitInspection + CommandPresets.shellUtilities).map { "Bash(\($0):*)" }
+            + ["--disallowedTools"] + CommandPresets.alwaysDenied.map { "Bash(\($0):*)" }
+            + ["--settings", sandbox]
+    }
+
     // MARK: - Shared
 
     private func common(schema: String, policy: String) -> [String] {

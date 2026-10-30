@@ -25,6 +25,8 @@ public struct ToolEnvironment: Sendable, Equatable {
             variables["JAVA_HOME"] = javaHome
         }
         variables["CI"] = "true"
+        // Gradle daemons detach from their parent, so they would outlive the run.
+        variables["GRADLE_OPTS"] = "-Dorg.gradle.daemon=false"
         variables["NO_UPDATE_NOTIFIER"] = "1"
         variables["npm_config_update_notifier"] = "false"
         return variables

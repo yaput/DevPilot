@@ -114,8 +114,9 @@ struct RepositoriesSettingsView: View {
 
     private func commandSummary(_ repository: RepositoryConfig) -> String {
         let setup = repository.setupCommands.filter(\.isEnabled).count
+        let validation = repository.validationCommands.filter(\.isEnabled).count
         let agent = repository.agentCommands.filter(\.isEnabled).count
-        return "\(setup) setup command\(setup == 1 ? "" : "s") · Claude may run \(agent) command\(agent == 1 ? "" : "s")"
+        return "\(setup) setup · \(validation) validation · Claude may run \(agent)"
     }
 
     private func remove(_ id: String) {
@@ -202,6 +203,12 @@ struct AgentSettingsView: View {
                 }
                 Stepper(value: $draft.implementationTimeoutMinutes, in: 5...180, step: 5) {
                     Text("Implementation time limit: \(draft.implementationTimeoutMinutes) min")
+                }
+                Stepper(value: $draft.validationTimeoutMinutes, in: 1...120, step: 1) {
+                    Text("Time limit per validation command: \(draft.validationTimeoutMinutes) min")
+                }
+                Stepper(value: $draft.automaticFixAttempts, in: 0...3) {
+                    Text("Automatic fix attempts when tests fail: \(draft.automaticFixAttempts)")
                 }
             } header: {
                 Text("Claude Code")
@@ -304,6 +311,13 @@ private struct RepositoryCommandsSheet: View {
                     Text("Run by DevPilot in a fresh worktree before Claude starts, with network access, in this order. Use them to install dependencies.")
                 }
                 Section {
+                    CommandList(rules: $repository.validationCommands, placeholder: "e.g. cd services/ui && pnpm run test")
+                } header: {
+                    Text("Validation commands")
+                } footer: {
+                    Text("Run by DevPilot after every implementation and fix, in the sandbox (no network, writes only in the worktree and build caches). Each must exit 0. Results go to the reviewer and to you.")
+                }
+                Section {
                     CommandList(rules: $repository.agentCommands, placeholder: "e.g. ./mvnw or pnpm")
                 } header: {
                     Text("Commands Claude may run")
@@ -330,7 +344,7 @@ private struct RepositoryCommandsSheet: View {
             }
             .padding(12)
         }
-        .frame(width: 600, height: 620)
+        .frame(width: 620, height: 700)
         .navigationTitle(repository.name)
     }
 
@@ -341,6 +355,9 @@ private struct RepositoryCommandsSheet: View {
         }
         for rule in presets.agent where !repository.agentCommands.contains(where: { $0.command == rule.command }) {
             repository.agentCommands.append(rule)
+        }
+        for rule in presets.validation where !repository.validationCommands.contains(where: { $0.command == rule.command }) {
+            repository.validationCommands.append(rule)
         }
     }
 }

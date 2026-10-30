@@ -13,6 +13,14 @@ struct TicketDetailData: Equatable {
     var latestImplementation: AgentRun? {
         runs.last { $0.kind == .implementation }
     }
+
+    var latestValidation: AgentRun? {
+        runs.last { $0.validation != nil }
+    }
+
+    var latestReview: AgentRun? {
+        runs.last { $0.review != nil }
+    }
 }
 
 /// Live progress of an agent run in this app session.
@@ -33,6 +41,7 @@ final class AppModel {
     private struct Services {
         let investigation: InvestigationService
         let implementation: ImplementationService
+        let verification: VerificationService
     }
 
     private let settingsStore: SettingsStore
@@ -70,7 +79,7 @@ final class AppModel {
         let settings = settingsStore.load(ProviderSettings.self)
         let agentSettings = settingsStore.load(AgentSettings.self)
         var workspaceSettings = settingsStore.load(WorkspaceSettings.self)
-        // Repositories added before per-repository commands existed get the detected presets.
+        // Repositories added before a kind of per-repository command existed get its presets once.
         if Self.fillMissingCommandPresets(&workspaceSettings) {
             try? settingsStore.save(workspaceSettings)
         }
@@ -88,6 +97,9 @@ final class AppModel {
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
             ProcessRunner.terminateAll()
         }
+        Notifier.shared.onOpenTicket = { [weak self] ticketID in
+            self?.selectedTicketID = ticketID
+        }
     }
 
     var providerKinds: [TicketProviderKind] { orchestrator.providerKinds }
@@ -104,6 +116,7 @@ final class AppModel {
 
     var runningCount: Int { states.values.filter(\.isAgentRunning).count }
     var pendingApprovalCount: Int { states.values.filter { $0 == .awaitingPlanApproval }.count }
+    var readyForReviewCount: Int { states.values.filter { $0 == .readyForHumanReview }.count }
     /// Settings that affect agent runs are locked while any run is in progress.
     var hasActiveRuns: Bool { !activity.isEmpty }
 
@@ -117,6 +130,7 @@ final class AppModel {
     func start() async {
         guard !started else { return }
         started = true
+        Notifier.shared.requestAuthorization()
         await recoverIfNeeded()
         await reload()
         await refresh()
@@ -188,6 +202,8 @@ final class AppModel {
             return
         }
         let service = services.implementation
+        let verification = services.verification
+        let fixAttempts = agentSettings.automaticFixAttempts
         launch(.implementation, ticketID: ticketID) { [self] onEvent in
             var tools = agentSettings.toolEnvironment
             if tools.path.isEmpty {
@@ -200,7 +216,69 @@ final class AppModel {
                 agentSettings = updated
             }
             _ = try await service.implement(ticketID: ticketID, repository: repository, tools: tools, onEvent: onEvent)
+            try await verification.verify(
+                ticketID: ticketID, repository: repository, tools: tools, maxFixAttempts: fixAttempts, onEvent: onEvent
+            )
         }
+    }
+
+    /// Runs validation and review (from `validating`, `reviewing`, or again from the hand-off).
+    func startVerification(_ ticketID: String, repositoryID: String) {
+        guard let repository = workspaceSettings.repository(id: repositoryID) else {
+            lastError = "This ticket's repository is no longer in Settings → Repositories."
+            return
+        }
+        let verification = services.verification
+        let tools = agentSettings.toolEnvironment
+        let fixAttempts = agentSettings.automaticFixAttempts
+        launch(.validation, ticketID: ticketID) { onEvent in
+            try await verification.verify(
+                ticketID: ticketID, repository: repository, tools: tools, maxFixAttempts: fixAttempts, onEvent: onEvent
+            )
+        }
+    }
+
+    /// The user asks Claude to fix specific things (failing tests, review findings), then
+    /// validation and review run again.
+    func fixWithClaude(_ ticketID: String, repositoryID: String, instructions: String) {
+        guard let repository = workspaceSettings.repository(id: repositoryID) else {
+            lastError = "This ticket's repository is no longer in Settings → Repositories."
+            return
+        }
+        let implementation = services.implementation
+        let verification = services.verification
+        let tools = agentSettings.toolEnvironment
+        let fixAttempts = agentSettings.automaticFixAttempts
+        launch(.implementation, ticketID: ticketID) { onEvent in
+            _ = try await implementation.implement(
+                ticketID: ticketID, repository: repository, tools: tools, fixInstructions: instructions, onEvent: onEvent
+            )
+            try await verification.verify(
+                ticketID: ticketID, repository: repository, tools: tools, maxFixAttempts: fixAttempts, onEvent: onEvent
+            )
+        }
+    }
+
+    /// Marks the ticket done and, if asked, removes its worktree (refused by git if anything
+    /// is uncommitted; the branch is kept unless fully merged or pushed).
+    func markDone(_ ticketID: String, removeWorktree: Bool) async {
+        do {
+            try await orchestrator.database.markDone(ticketID: ticketID)
+        } catch {
+            lastError = error.localizedDescription
+            await reload()
+            return
+        }
+        if removeWorktree {
+            await discardWorktree(ticketID)
+        }
+        await reload()
+        detailRevision += 1
+    }
+
+    func branchStatus(_ ticketID: String) async -> BranchStatus? {
+        guard let workspace = try? await orchestrator.database.workspace(ticketID: ticketID) else { return nil }
+        return await GitWorktreeManager(worktreeRoot: workspaceSettings.resolvedWorktreeRoot).branchStatus(workspace)
     }
 
     /// After a failed or stopped implementation: back to the approved plan, then implement again.
@@ -253,6 +331,26 @@ final class AppModel {
             lastError = "Could not load ticket details: \(error.localizedDescription)"
             return TicketDetailData()
         }
+    }
+
+    /// A clean slate: worktree (including uncommitted changes, the user confirmed), plans,
+    /// answers, runs and transcripts are gone from view; the ticket is back at `selected`.
+    func startOver(_ ticketID: String) async {
+        guard !isRunning(ticketID) else { return }
+        do {
+            let service = StartOverService(
+                database: orchestrator.database,
+                worktrees: GitWorktreeManager(worktreeRoot: workspaceSettings.resolvedWorktreeRoot),
+                artifacts: artifacts
+            )
+            if let branch = try await service.startOver(ticketID: ticketID) {
+                lastError = "Started over. Branch \(branch) has commits, so it was kept; the new worktree gets a new branch."
+            }
+        } catch {
+            lastError = "Could not start over: \(error.localizedDescription)"
+        }
+        await reload()
+        detailRevision += 1
     }
 
     /// Removes the ticket's worktree (refused if it has uncommitted changes) so the next
@@ -358,6 +456,25 @@ final class AppModel {
             activity[ticketID] = nil
             await reload()
             detailRevision += 1
+            notifyOutcome(ticketID)
+        }
+    }
+
+    /// Plan ready, clarification needed, ready for review, or failure.
+    private func notifyOutcome(_ ticketID: String) {
+        guard let ticket = tickets.first(where: { $0.id == ticketID }) else { return }
+        let name = "\(ticket.externalID): \(ticket.title)"
+        switch state(of: ticketID) {
+        case .awaitingPlanApproval:
+            Notifier.shared.post(title: "Plan ready for approval", body: name, ticketID: ticketID)
+        case .needsClarification:
+            Notifier.shared.post(title: "Clarification needed", body: name, ticketID: ticketID)
+        case .readyForHumanReview:
+            Notifier.shared.post(title: "Ready for your review", body: name, ticketID: ticketID)
+        case .failed:
+            Notifier.shared.post(title: "Run failed", body: name, ticketID: ticketID)
+        default:
+            break
         }
     }
 
@@ -418,11 +535,23 @@ final class AppModel {
 
     private static func fillMissingCommandPresets(_ settings: inout WorkspaceSettings) -> Bool {
         var changed = false
-        for index in settings.repositories.indices
-        where settings.repositories[index].setupCommands.isEmpty && settings.repositories[index].agentCommands.isEmpty {
-            let presets = CommandPresets.detect(repositoryAt: settings.repositories[index].path)
-            settings.repositories[index].setupCommands = presets.setup
-            settings.repositories[index].agentCommands = presets.agent
+        for index in settings.repositories.indices {
+            let repository = settings.repositories[index]
+            let needsCommands = repository.setupCommands.isEmpty && repository.agentCommands.isEmpty
+            let needsValidation = settings.presetsVersion < 1 && repository.validationCommands.isEmpty
+            guard needsCommands || needsValidation else { continue }
+            let presets = CommandPresets.detect(repositoryAt: repository.path)
+            if needsCommands {
+                settings.repositories[index].setupCommands = presets.setup
+                settings.repositories[index].agentCommands = presets.agent
+            }
+            if needsValidation || needsCommands {
+                settings.repositories[index].validationCommands = presets.validation
+            }
+            changed = true
+        }
+        if settings.presetsVersion < 1 {
+            settings.presetsVersion = 1
             changed = true
         }
         return changed
@@ -464,9 +593,14 @@ final class AppModel {
             UnavailableAgentRunner(reason: "Claude Code was not found. Set its location in Settings → Agent.")
         }
         let worktrees = GitWorktreeManager(worktreeRoot: workspace.resolvedWorktreeRoot)
+        let implementation = ImplementationService(database: database, worktrees: worktrees, runner: runner, artifacts: artifacts)
         return Services(
             investigation: InvestigationService(database: database, worktrees: worktrees, runner: runner, artifacts: artifacts),
-            implementation: ImplementationService(database: database, worktrees: worktrees, runner: runner, artifacts: artifacts)
+            implementation: implementation,
+            verification: VerificationService(
+                database: database, worktrees: worktrees, runner: runner, implementation: implementation,
+                validationTimeout: .seconds(max(1, agent.validationTimeoutMinutes) * 60), artifacts: artifacts
+            )
         )
     }
 }

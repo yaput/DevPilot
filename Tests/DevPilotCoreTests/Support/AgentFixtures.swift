@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 @testable import DevPilotCore
 
 extension Investigation {
@@ -21,18 +22,29 @@ final class FakeAgentRunner: AgentRunner, @unchecked Sendable {
     private var _requests: [InvestigationRequest] = []
     private var _implementations: [ImplementationRequest] = []
     private let behavior: @Sendable (InvestigationRequest) async throws -> Investigation
+    private var _reviews: [ReviewRequest] = []
     private let implementation: @Sendable (ImplementationRequest) async throws -> ImplementationReport
+    private let reviewing: @Sendable (ReviewRequest) async throws -> ReviewReport
 
     init(
         _ behavior: @escaping @Sendable (InvestigationRequest) async throws -> Investigation = { _ in .sample() },
-        implement: @escaping @Sendable (ImplementationRequest) async throws -> ImplementationReport = { _ in .sample() }
+        implement: @escaping @Sendable (ImplementationRequest) async throws -> ImplementationReport = { _ in .sample() },
+        review: @escaping @Sendable (ReviewRequest) async throws -> ReviewReport = { _ in .sample() }
     ) {
         self.behavior = behavior
         self.implementation = implement
+        self.reviewing = review
     }
 
     var requests: [InvestigationRequest] { lock.withLock { _requests } }
     var implementations: [ImplementationRequest] { lock.withLock { _implementations } }
+    var reviews: [ReviewRequest] { lock.withLock { _reviews } }
+
+    func review(_ request: ReviewRequest, onProgress: @escaping @Sendable (String) -> Void) async throws -> (ReviewReport, AgentRunStats) {
+        lock.withLock { _reviews.append(request) }
+        onProgress("Reading Sources/Webhooks.swift")
+        return (try await reviewing(request), AgentRunStats(numTurns: 5, costUSD: 0.1))
+    }
 
     func investigate(_ request: InvestigationRequest, onProgress: @escaping @Sendable (String) -> Void) async throws -> (Investigation, AgentRunStats) {
         lock.withLock { _requests.append(request) }
@@ -118,5 +130,34 @@ extension TicketWorkspace {
             baseBranch: "main", baseCommit: "0123456789abcdef0123", branch: "devpilot/jira-plat-182",
             worktreePath: worktree, createdAt: Date(timeIntervalSince1970: 1_790_000_000)
         )
+    }
+}
+
+extension ReviewReport {
+    static func sample(verdict: Verdict = .approve, findings: [Finding] = []) -> ReviewReport {
+        ReviewReport(
+            verdict: verdict, summary: "Looks right.", findings: findings,
+            planCoverage: [PlanStep(step: "Add backoff", status: .done, note: "")],
+            testAssessment: "Covered.", unresolvedRisks: []
+        )
+    }
+}
+
+extension AppDatabase {
+    /// Rows for a ticket across all attempts, bypassing attempt scoping.
+    func rowCountForTest(table: String, ticketID: String) async throws -> Int {
+        try await writer.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(table) WHERE ticketID = ?", arguments: [ticketID]) ?? 0
+        }
+    }
+
+    /// A clarification answer in the current attempt, so tests can check it is not carried over.
+    func recordClarificationForTest(ticketID: String) async throws {
+        try await writer.write { db in
+            try db.execute(
+                sql: "INSERT INTO workflowEvent (ticketID, kind, message, createdAt, attempt) VALUES (?, 'clarification', 'old answer', 0, 1)",
+                arguments: [ticketID]
+            )
+        }
     }
 }

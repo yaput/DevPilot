@@ -391,9 +391,16 @@ struct CommandPresetTests {
             files.forEach { FileManager.default.createFile(atPath: dir.appending(path: $0).path, contents: Data()) }
         }
 
+        try #"{"scripts": {"test": "vitest", "lint": "eslint .", "dev": "vite"}}"#
+            .write(to: url.appending(path: "services/ui/package.json"), atomically: true, encoding: .utf8)
         let presets = CommandPresets.detect(repositoryAt: url.path)
 
         #expect(CommandPresets.projectDirectories(in: url) == ["services/core", "services/ui"])
+        #expect(presets.validation.map(\.command) == [
+            "cd services/core && ./gradlew --no-daemon --offline test",
+            "cd services/ui && pnpm run lint",
+            "cd services/ui && pnpm run test",
+        ])
         #expect(presets.setup.map(\.command) == [
             "cd services/core && ./gradlew --no-daemon -q testClasses",
             "cd services/ui && pnpm install --frozen-lockfile",

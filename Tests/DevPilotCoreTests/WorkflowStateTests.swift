@@ -21,8 +21,9 @@ struct WorkflowStateTests {
     }
 
     @Test func onlyApprovedOrFixRetryCanEnterImplementation() {
+        // Fixes come from validation, review, or the user at hand-off; `beginFix` re-checks the approval.
         let entries = WorkflowState.allCases.filter { $0.canTransition(to: .implementing) }
-        #expect(Set(entries) == [.approved, .validating, .reviewing])
+        #expect(Set(entries) == [.approved, .validating, .reviewing, .readyForHumanReview])
     }
 
     @Test func clarificationCannotAdvanceTowardsImplementation() {

@@ -26,4 +26,25 @@ struct EditorApp: Identifiable, Hashable {
     func open(_ url: URL) {
         NSWorkspace.shared.open([url], withApplicationAt: self.url, configuration: NSWorkspace.OpenConfiguration())
     }
+
+    /// Opens a file at a line through the editor's URL scheme (`idea://`, `vscode://`), falling
+    /// back to just opening the file.
+    func open(_ file: URL, line: Int) {
+        let path = file.path
+        // Strict: `&`, `?`, `#` etc. in a path must not break the link.
+        let encoded = path.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "/-._~").union(.alphanumerics)) ?? path
+        let link: String? = switch bundleID {
+        case "com.jetbrains.intellij", "com.jetbrains.intellij.ce": "idea://open?file=\(encoded)&line=\(line)"
+        case "com.jetbrains.WebStorm": "webstorm://open?file=\(encoded)&line=\(line)"
+        case "com.microsoft.VSCode": "vscode://file\(encoded):\(line)"
+        case "com.todesktop.230313mzl4w4u92": "cursor://file\(encoded):\(line)"
+        case "dev.zed.Zed": "zed://file\(encoded):\(line)"
+        default: nil
+        }
+        if line > 0, let link, let url = URL(string: link), NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+            NSWorkspace.shared.open(url)
+        } else {
+            open(file)
+        }
+    }
 }

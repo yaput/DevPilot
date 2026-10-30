@@ -38,7 +38,7 @@ struct DevPilotApp: App {
             MenuBarView()
                 .environment(model)
         } label: {
-            Image(systemName: model.pendingApprovalCount > 0 ? "paperplane.circle.fill" : "paperplane")
+            Image(systemName: model.pendingApprovalCount + model.readyForReviewCount > 0 ? "paperplane.circle.fill" : "paperplane")
         }
     }
 }

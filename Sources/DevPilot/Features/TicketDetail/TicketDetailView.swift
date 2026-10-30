@@ -14,6 +14,9 @@ struct TicketDetailView: View {
             VStack(alignment: .leading, spacing: 24) {
                 header(state: state)
                 WorkflowPanel(ticket: ticket, state: state, detail: detail) { reviewingPlan = $0 }
+                if detail.latestValidation != nil || detail.latestReview != nil {
+                    VerificationSection(ticket: ticket, detail: detail)
+                }
                 if let run = detail.latestImplementation, let result = run.implementation {
                     ImplementationSection(run: run, result: result)
                 }
@@ -82,6 +85,8 @@ private struct WorkflowPanel: View {
     @State private var baseBranch = ""
     @State private var answers = ""
     @State private var confirmingDiscard = false
+    @State private var confirmingStartOver = false
+    @State private var startOverStatus: BranchStatus?
 
     var body: some View {
         GroupBox {
@@ -89,6 +94,19 @@ private struct WorkflowPanel: View {
                 repositoryRow
                 Divider()
                 stateContent
+                if canStartOver {
+                    HStack {
+                        Spacer()
+                        Button("Start Over…") {
+                            Task {
+                                startOverStatus = await model.branchStatus(ticket.id)
+                                confirmingStartOver = true
+                            }
+                        }
+                        .controlSize(.small)
+                        .help("Back to the start with a fresh worktree, no earlier plans or answers, and transcripts deleted.")
+                    }
+                }
                 if let error = lastRunError {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.red)
@@ -98,6 +116,11 @@ private struct WorkflowPanel: View {
             }
             .padding(6)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .confirmationDialog("Start \(ticket.externalID) over?", isPresented: $confirmingStartOver) {
+            Button("Start Over", role: .destructive) { Task { await model.startOver(ticket.id) } }
+        } message: {
+            Text(startOverMessage)
         }
         .onAppear { repositoryID = repositoryID ?? model.workspaceSettings.suggestedRepository(for: ticket)?.id }
         .onChange(of: ticket.id) {
@@ -120,7 +143,10 @@ private struct WorkflowPanel: View {
                         .font(.callout.monospaced())
                 }
                 HStack {
-                    Button("View Changes") { openWindow(id: AppWindow.changes, value: ticket.id) }
+                    // Investigation only reads; there is nothing to show before an implementation.
+                    if detail.latestImplementation != nil {
+                        Button("View Changes") { openWindow(id: AppWindow.changes, value: ticket.id) }
+                    }
                     OpenWorktreeMenu(workspace: workspace)
                         .fixedSize()
                     Button("Reveal in Finder") {
@@ -173,6 +199,26 @@ private struct WorkflowPanel: View {
         baseBranch = repositoryID.flatMap(model.workspaceSettings.repository(id:))?.baseBranch ?? ""
     }
 
+    /// Any resting state with something to clear (also `selected` when earlier work exists).
+    private var canStartOver: Bool {
+        guard !state.isAgentRunning, !model.isRunning(ticket.id), ![.discovered, .completeManual].contains(state) else { return false }
+        return state != .selected || detail.document != nil || !detail.runs.isEmpty || detail.workspace != nil
+    }
+
+    private var startOverMessage: String {
+        var parts = ["A clean slate: the ticket goes back to the start. Earlier plans, answers, runs and history are cleared, transcripts and logs are deleted, and the next investigation starts without them."]
+        if let workspace = detail.workspace {
+            let files = startOverStatus?.uncommittedFiles ?? 0
+            parts.append(files > 0
+                ? "The worktree is removed, including \(files) uncommitted file\(files == 1 ? "" : "s"), which will be permanently lost."
+                : "The worktree is removed (no uncommitted changes).")
+            if let commits = startOverStatus?.commitsSinceBase, commits > 0 {
+                parts.append("Branch \(workspace.branch) has \(commits) commit\(commits == 1 ? "" : "s") and is kept.")
+            }
+        }
+        return parts.joined(separator: " ")
+    }
+
     private var effectiveRepositoryID: String? {
         detail.workspace?.repositoryID ?? repositoryID
     }
@@ -215,6 +261,8 @@ private struct WorkflowPanel: View {
             }
         case .investigating, .implementing:
             RunProgress(ticketID: ticket.id)
+        case .validating, .reviewing where model.isRunning(ticket.id):
+            RunProgress(ticketID: ticket.id)
         case .needsClarification:
             clarificationForm
         case .planReady, .awaitingPlanApproval:
@@ -227,14 +275,23 @@ private struct WorkflowPanel: View {
             }
         case .approved:
             implementForm
-        case .validating:
-            VStack(alignment: .leading, spacing: 6) {
-                Label("Implemented. Review the changes in the worktree with your IDE, then commit them yourself.", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                Text("Automatic test runs and an independent review arrive in M5.")
-                    .font(.caption)
+        case .validating, .reviewing:
+            // Resting here: verification was interrupted, failed to start, or predates M5.
+            HStack {
+                Text(state == .validating ? "Implemented. Tests and review have not run yet." : "Tests ran; the review did not finish.")
                     .foregroundStyle(.secondary)
+                if let id = effectiveRepositoryID {
+                    Button(state == .validating ? "Run Tests & Review" : "Run Review") { model.startVerification(ticket.id, repositoryID: id) }
+                        .buttonStyle(.borderedProminent)
+                }
+                cancelButton
             }
+        case .readyForHumanReview:
+            if let id = effectiveRepositoryID {
+                HandoffPanel(ticket: ticket, detail: detail, repositoryID: id)
+            }
+        case .completeManual:
+            DonePanel(ticketID: ticket.id, hasWorktree: detail.workspace != nil)
         case .failed, .cancelled, .rejected:
             HStack {
                 Text(state == .rejected ? "Plan rejected." : "Stopped.")
@@ -247,8 +304,6 @@ private struct WorkflowPanel: View {
                 Button("Restart") { Task { await model.select(ticket.id) } }
                     .help("Start over from investigation.")
             }
-        case .reviewing, .readyForHumanReview, .completeManual:
-            Text("\(state.displayName).").foregroundStyle(.secondary)
         }
     }
 
@@ -338,7 +393,8 @@ private struct WorkflowPanel: View {
     }
 
     private var lastRunError: String? {
-        guard [.failed, .cancelled].contains(state), let run = detail.runs.last, run.outcome != .succeeded else { return nil }
+        guard [.failed, .cancelled, .validating, .reviewing].contains(state), !model.isRunning(ticket.id),
+              let run = detail.runs.last, let outcome = run.outcome, outcome != .succeeded else { return nil }
         return run.errorMessage
     }
 }
@@ -347,13 +403,24 @@ private struct RunProgress: View {
     @Environment(AppModel.self) private var model
     let ticketID: String
 
+    /// One run can go through several phases (implement → test → fix → review).
+    private var phase: String {
+        switch model.state(of: ticketID) {
+        case .investigating: "Investigating"
+        case .implementing: "Implementing"
+        case .validating: "Running tests"
+        case .reviewing: "Reviewing"
+        default: "Working"
+        }
+    }
+
     var body: some View {
         if let activity = model.activity[ticketID] {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     ProgressView().controlSize(.small)
                     TimelineView(.periodic(from: activity.startedAt, by: 1)) { context in
-                        Text("\(activity.kind == .implementation ? "Implementing" : "Investigating")… \(Duration.seconds(context.date.timeIntervalSince(activity.startedAt)).formatted(.time(pattern: .minuteSecond)))")
+                        Text("\(phase)… \(Duration.seconds(context.date.timeIntervalSince(activity.startedAt)).formatted(.time(pattern: .minuteSecond)))")
                             .monospacedDigit()
                     }
                     Spacer()
