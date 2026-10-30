@@ -26,10 +26,13 @@ public struct TicketComment: Codable, Sendable, Hashable {
     }
 }
 
-/// A ticket normalized from any provider. `id` is always provider-prefixed
-/// (`shortcut:1234`, `jira:ABC-12`) so identities never collide across providers.
+/// A ticket normalized from any provider. `id` is provider-prefixed and source-qualified
+/// (`shortcut:acme/1234`, `jira:acme.atlassian.net/ABC-12`) so identities never collide across
+/// providers, or across Jira sites / Shortcut workspaces when the user switches between them.
 public struct Ticket: Identifiable, Codable, Sendable, Hashable {
     public let provider: TicketProviderKind
+    /// Jira site host or Shortcut workspace slug the ticket was fetched from.
+    public let source: String
     /// Shortcut story ID or Jira issue key.
     public let externalID: String
     public let title: String
@@ -43,14 +46,15 @@ public struct Ticket: Identifiable, Codable, Sendable, Hashable {
     public let acceptanceCriteria: [String]
     public let fetchedAt: Date
 
-    public var id: String { Self.makeID(provider: provider, externalID: externalID) }
+    public var id: String { Self.makeID(provider: provider, source: source, externalID: externalID) }
 
-    public static func makeID(provider: TicketProviderKind, externalID: String) -> String {
-        "\(provider.rawValue):\(externalID)"
+    public static func makeID(provider: TicketProviderKind, source: String, externalID: String) -> String {
+        "\(provider.rawValue):\(source)/\(externalID)"
     }
 
     public init(
         provider: TicketProviderKind,
+        source: String,
         externalID: String,
         title: String,
         description: String,
@@ -62,6 +66,7 @@ public struct Ticket: Identifiable, Codable, Sendable, Hashable {
         fetchedAt: Date
     ) {
         self.provider = provider
+        self.source = source
         self.externalID = externalID
         self.title = title
         self.description = description

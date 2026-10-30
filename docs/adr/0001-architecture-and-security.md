@@ -47,8 +47,14 @@ through the Mac App Store.
 
 ### 4. Ticket providers are read-only and identity-preserving
 
-- `TicketProvider` exposes only reads. IDs are always provider-prefixed
-  (`shortcut:4211`, `jira:PLAT-182`).
+- `TicketProvider` exposes only reads. IDs are provider-prefixed and qualified by source
+  (`shortcut:acme/4211`, `jira:acme.atlassian.net/PLAT-182`). Site URLs are user-configurable,
+  so a bare issue key is not unique: without the source, switching Jira sites would attach one
+  ticket's workflow state and approvals to an unrelated ticket with the same key.
+- Each sync records the provider's complete assigned set. Tickets no longer returned are
+  marked unassigned and hidden, unless their workflow is in progress.
+- Site URLs must be https, and Shortcut pagination links are rejected if they point to another
+  host, so tokens are never sent anywhere but the configured site.
 - A sync that returns a ticket from another provider is rejected. One provider failing
   does not block the other.
 - Ticket text is untrusted input. It is passed to the agent as data, never as instructions

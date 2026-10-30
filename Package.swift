@@ -23,7 +23,8 @@ let package = Package(
         ),
         .testTarget(
             name: "DevPilotCoreTests",
-            dependencies: ["DevPilotCore"]
+            dependencies: ["DevPilotCore"],
+            resources: [.copy("Fixtures")]
         ),
     ]
 )

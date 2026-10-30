@@ -3,7 +3,14 @@ import SwiftUI
 
 @main
 struct DevPilotApp: App {
-    @State private var model = AppContainer.makeModel()
+    @State private var model: AppModel
+    @State private var providerSettings: ProviderSettingsModel
+
+    init() {
+        let (model, providerSettings) = AppContainer.makeModels()
+        _model = State(initialValue: model)
+        _providerSettings = State(initialValue: providerSettings)
+    }
 
     var body: some Scene {
         Window("DevPilot", id: AppWindow.dashboard) {
@@ -16,6 +23,7 @@ struct DevPilotApp: App {
         Settings {
             SettingsView()
                 .environment(model)
+                .environment(providerSettings)
         }
 
         MenuBarExtra {

@@ -1,7 +1,9 @@
 import Foundation
 
-/// Fixture-backed provider used until the real Shortcut/Jira adapters land (M2), and in tests.
+/// Fixture-backed provider behind the "Use sample data" setting, and in tests.
 public struct MockTicketProvider: TicketProvider {
+    public static let source = "sample"
+
     public let kind: TicketProviderKind
     private let tickets: [Ticket]
 
@@ -14,12 +16,15 @@ public struct MockTicketProvider: TicketProvider {
         tickets
     }
 
-    /// Accepts either the external ID (`ABC-12`) or the provider-prefixed ID (`jira:ABC-12`).
     public func ticket(id: String) async throws -> Ticket {
-        guard let ticket = tickets.first(where: { $0.externalID == id || $0.id == id }) else {
+        guard let ticket = tickets.first(where: { $0.externalID == externalID(from: id) }) else {
             throw TicketProviderError.notFound(id)
         }
         return ticket
+    }
+
+    public func checkConnection() async throws -> String {
+        "Sample data (\(tickets.count) tickets)"
     }
 }
 
@@ -32,7 +37,7 @@ extension MockTicketProvider {
         case .shortcut:
             let story = { (id: String, title: String, description: String, status: String, comments: [TicketComment], criteria: [String]) in
                 Ticket(
-                    provider: .shortcut, externalID: id, title: title, description: description, status: status,
+                    provider: .shortcut, source: Self.source, externalID: id, title: title, description: description, status: status,
                     assignee: "me", url: URL(string: "https://app.shortcut.com/example/story/\(id)")!,
                     comments: comments, acceptanceCriteria: criteria, fetchedAt: now
                 )
@@ -63,7 +68,7 @@ extension MockTicketProvider {
         case .jira:
             let issue = { (key: String, title: String, description: String, status: String, comments: [TicketComment], criteria: [String]) in
                 Ticket(
-                    provider: .jira, externalID: key, title: title, description: description, status: status,
+                    provider: .jira, source: Self.source, externalID: key, title: title, description: description, status: status,
                     assignee: "me", url: URL(string: "https://example.atlassian.net/browse/\(key)")!,
                     comments: comments, acceptanceCriteria: criteria, fetchedAt: now
                 )

@@ -1,0 +1,7 @@
+[
+  { "id": 500, "name": "Engineering", "states": [
+    { "id": 500001, "name": "Ready for Development", "type": "unstarted" },
+    { "id": 500002, "name": "In Development", "type": "started" },
+    { "id": 500003, "name": "Done", "type": "done" }
+  ]}
+]

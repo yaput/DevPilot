@@ -6,6 +6,7 @@ private struct FailingProvider: TicketProvider {
     let kind: TicketProviderKind
     func assignedTickets() async throws -> [Ticket] { throw TicketProviderError.unauthorized }
     func ticket(id: String) async throws -> Ticket { throw TicketProviderError.unauthorized }
+    func checkConnection() async throws -> String { throw TicketProviderError.unauthorized }
 }
 
 struct WorkflowOrchestratorTests {
@@ -19,7 +20,7 @@ struct WorkflowOrchestratorTests {
         let tickets = try await db.tickets()
         #expect(tickets.count == 6)
         #expect(Set(tickets.map(\.provider)) == [.shortcut, .jira])
-        #expect(tickets.allSatisfy { $0.id == "\($0.provider.rawValue):\($0.externalID)" })
+        #expect(tickets.allSatisfy { $0.id == "\($0.provider.rawValue):sample/\($0.externalID)" })
     }
 
     @Test func oneProviderFailingDoesNotBlockTheOther() async throws {

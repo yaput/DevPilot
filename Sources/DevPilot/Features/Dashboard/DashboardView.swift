@@ -8,10 +8,18 @@ struct DashboardView: View {
         @Bindable var model = model
         NavigationSplitView {
             List(model.filteredTickets, selection: $model.selectedTicketID) { ticket in
-                TicketRow(ticket: ticket, state: model.state(of: ticket.id))
+                TicketRow(ticket: ticket, state: model.state(of: ticket.id), isUnassigned: model.unassignedIDs.contains(ticket.id))
             }
             .overlay {
-                if model.filteredTickets.isEmpty && !model.isSyncing {
+                if !model.hasProviders {
+                    ContentUnavailableView {
+                        Label("No ticket sources", systemImage: "link")
+                    } description: {
+                        Text("Connect Shortcut or Jira, or turn on sample data.")
+                    } actions: {
+                        SettingsLink { Text("Open Settings…") }
+                    }
+                } else if model.filteredTickets.isEmpty && !model.isSyncing {
                     ContentUnavailableView("No assigned tickets", systemImage: "tray", description: Text("Refresh to sync."))
                 }
             }
@@ -55,6 +63,7 @@ struct DashboardView: View {
 private struct TicketRow: View {
     let ticket: Ticket
     let state: WorkflowState
+    let isUnassigned: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -63,6 +72,13 @@ private struct TicketRow: View {
                 Text(ticket.externalID)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
+                    .help(ticket.source)
+                if isUnassigned {
+                    Text("Not assigned")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .help("No longer returned by \(ticket.provider.displayName); kept because work on it is in progress.")
+                }
                 Spacer()
                 StateBadge(state: state)
             }

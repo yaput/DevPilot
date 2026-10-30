@@ -1,0 +1,3 @@
+{ "data": [ { "id": 4211, "archived": false, "completed": false }, { "id": 4300, "archived": false, "completed": true } ],
+  "next": "/api/v3/search/stories?query=owner%3Ajane&page_size=25&detail=slim&next=abc123",
+  "total": 3 }

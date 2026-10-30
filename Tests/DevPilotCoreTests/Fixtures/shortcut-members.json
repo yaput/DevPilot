@@ -1,0 +1,4 @@
+[
+  { "id": "m-1", "profile": { "name": "Jane Doe", "mention_name": "jane" } },
+  { "id": "m-2", "profile": { "name": "Product Manager", "mention_name": "pm" } }
+]

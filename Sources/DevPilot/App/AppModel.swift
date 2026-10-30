@@ -6,11 +6,16 @@ import Observation
 @MainActor
 @Observable
 final class AppModel {
-    private let orchestrator: WorkflowOrchestrator
-    let databaseLocation: String
+    private let settingsStore: SettingsStore
+    private let factory: ProviderFactory
+    private var orchestrator: WorkflowOrchestrator
+    private var recoveredDatabasePath: String?
 
+    private(set) var settings: ProviderSettings
+    private(set) var databaseLocation: String
     private(set) var tickets: [Ticket] = []
     private(set) var states: [String: WorkflowState] = [:]
+    private(set) var unassignedIDs: Set<String> = []
     private(set) var syncResults: [TicketProviderKind: ProviderSyncResult] = [:]
     private(set) var isSyncing = false
     var providerFilter: TicketProviderKind?
@@ -19,12 +24,16 @@ final class AppModel {
 
     private var started = false
 
-    init(orchestrator: WorkflowOrchestrator, databaseLocation: String) {
-        self.orchestrator = orchestrator
-        self.databaseLocation = databaseLocation
+    init(settingsStore: SettingsStore, factory: ProviderFactory) {
+        self.settingsStore = settingsStore
+        self.factory = factory
+        let settings = settingsStore.load()
+        self.settings = settings
+        (orchestrator, databaseLocation, lastError) = Self.makeOrchestrator(settings: settings, factory: factory)
     }
 
     var providerKinds: [TicketProviderKind] { orchestrator.providerKinds }
+    var hasProviders: Bool { !providerKinds.isEmpty }
 
     var filteredTickets: [Ticket] {
         guard let providerFilter else { return tickets }
@@ -46,14 +55,20 @@ final class AppModel {
     func start() async {
         guard !started else { return }
         started = true
-        do {
-            let interrupted = try await orchestrator.recoverInterruptedRuns()
-            if !interrupted.isEmpty {
-                lastError = "\(interrupted.count) run(s) were interrupted when DevPilot last quit and have been marked failed."
-            }
-        } catch {
-            lastError = "Crash recovery failed: \(error)"
-        }
+        await recoverIfNeeded()
+        await reload()
+        await refresh()
+    }
+
+    /// Re-reads saved settings, rebuilds providers (switching database when sample data is
+    /// toggled) and syncs.
+    func reconfigure() async {
+        settings = settingsStore.load()
+        let message: String?
+        (orchestrator, databaseLocation, message) = Self.makeOrchestrator(settings: settings, factory: factory)
+        if let message { lastError = message }
+        syncResults = [:]
+        await recoverIfNeeded()
         await reload()
         await refresh()
     }
@@ -85,11 +100,25 @@ final class AppModel {
         }
     }
 
+    /// Runs crash recovery once per database file per launch.
+    private func recoverIfNeeded() async {
+        guard recoveredDatabasePath != databaseLocation else { return }
+        recoveredDatabasePath = databaseLocation
+        do {
+            let interrupted = try await orchestrator.recoverInterruptedRuns()
+            if !interrupted.isEmpty {
+                lastError = "\(interrupted.count) run(s) were interrupted when DevPilot last quit and have been marked failed."
+            }
+        } catch {
+            lastError = "Crash recovery failed: \(error)"
+        }
+    }
+
     private func perform(_ action: (WorkflowOrchestrator) async throws -> Void) async {
         do {
             try await action(orchestrator)
         } catch {
-            lastError = String(describing: error)
+            lastError = error.localizedDescription
         }
         await reload()
     }
@@ -98,8 +127,32 @@ final class AppModel {
         do {
             tickets = try await orchestrator.database.tickets()
             states = try await orchestrator.database.workflowStates()
+            unassignedIDs = try await orchestrator.database.unassignedTicketIDs()
         } catch {
             lastError = "Could not load tickets: \(error)"
+        }
+        if let selectedTicketID, !tickets.contains(where: { $0.id == selectedTicketID }) {
+            self.selectedTicketID = nil
+        }
+    }
+
+    /// Sample data and live data never share a database.
+    private static func makeOrchestrator(
+        settings: ProviderSettings,
+        factory: ProviderFactory
+    ) -> (WorkflowOrchestrator, String, String?) {
+        let providers = factory.makeProviders(settings)
+        let url = AppDatabase.defaultDirectory.appending(path: settings.useSampleData ? "devpilot-sample.sqlite" : "devpilot.sqlite")
+        do {
+            return (WorkflowOrchestrator(database: try AppDatabase.onDisk(at: url), providers: providers), url.path, nil)
+        } catch {
+            // An in-memory database only fails on a schema bug, which tests catch.
+            let database = try! AppDatabase.inMemory()
+            return (
+                WorkflowOrchestrator(database: database, providers: providers),
+                "In-memory (changes will not be saved)",
+                "Could not open \(url.path): \(error.localizedDescription). Using a temporary in-memory database."
+            )
         }
     }
 }

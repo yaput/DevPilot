@@ -36,6 +36,7 @@ public final class AppDatabase: Sendable {
                 CREATE TABLE ticket (
                     id TEXT PRIMARY KEY NOT NULL,
                     provider TEXT NOT NULL,
+                    source TEXT NOT NULL,
                     externalID TEXT NOT NULL,
                     title TEXT NOT NULL,
                     description TEXT NOT NULL,
@@ -45,7 +46,9 @@ public final class AppDatabase: Sendable {
                     commentsJSON TEXT NOT NULL,
                     acceptanceCriteriaJSON TEXT NOT NULL,
                     fetchedAt REAL NOT NULL,
-                    UNIQUE (provider, externalID)
+                    -- 0 once the provider stops returning the ticket (reassigned, done, or another site).
+                    isAssigned INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE (provider, source, externalID)
                 );
                 CREATE TABLE ticketWorkflow (
                     ticketID TEXT PRIMARY KEY NOT NULL REFERENCES ticket(id) ON DELETE CASCADE,
@@ -86,24 +89,27 @@ public final class AppDatabase: Sendable {
 
     // MARK: - Tickets
 
-    /// Inserts or refreshes tickets. Newly seen tickets start in `discovered`; existing
-    /// tickets keep their workflow state.
-    public func upsertTickets(_ tickets: [Ticket]) async throws {
+    /// Records the complete set of tickets a provider currently assigns to the user: inserts or
+    /// refreshes them, and marks that provider's other tickets as no longer assigned. Newly seen
+    /// tickets start in `discovered`; existing tickets keep their workflow state.
+    public func recordSync(_ tickets: [Ticket], for provider: TicketProviderKind) async throws {
+        precondition(tickets.allSatisfy { $0.provider == provider }, "Tickets must belong to \(provider)")
         try await writer.write { db in
             for ticket in tickets {
                 try db.execute(
                     sql: """
-                        INSERT INTO ticket (id, provider, externalID, title, description, status, assignee, url,
-                                            commentsJSON, acceptanceCriteriaJSON, fetchedAt)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO ticket (id, provider, source, externalID, title, description, status, assignee, url,
+                                            commentsJSON, acceptanceCriteriaJSON, fetchedAt, isAssigned)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                         ON CONFLICT(id) DO UPDATE SET
                             title = excluded.title, description = excluded.description, status = excluded.status,
                             assignee = excluded.assignee, url = excluded.url, commentsJSON = excluded.commentsJSON,
-                            acceptanceCriteriaJSON = excluded.acceptanceCriteriaJSON, fetchedAt = excluded.fetchedAt
+                            acceptanceCriteriaJSON = excluded.acceptanceCriteriaJSON, fetchedAt = excluded.fetchedAt,
+                            isAssigned = 1
                         """,
                     arguments: [
-                        ticket.id, ticket.provider.rawValue, ticket.externalID, ticket.title, ticket.description,
-                        ticket.status, ticket.assignee, ticket.url.absoluteString,
+                        ticket.id, ticket.provider.rawValue, ticket.source, ticket.externalID, ticket.title,
+                        ticket.description, ticket.status, ticket.assignee, ticket.url.absoluteString,
                         try Self.json(ticket.comments), try Self.json(ticket.acceptanceCriteria),
                         ticket.fetchedAt.timeIntervalSince1970,
                     ]
@@ -121,14 +127,40 @@ public final class AppDatabase: Sendable {
                     )
                 }
             }
+            try db.execute(sql: "CREATE TEMP TABLE IF NOT EXISTS syncedTicket (id TEXT PRIMARY KEY)")
+            try db.execute(sql: "DELETE FROM syncedTicket")
+            for ticket in tickets {
+                try db.execute(sql: "INSERT INTO syncedTicket (id) VALUES (?)", arguments: [ticket.id])
+            }
+            try db.execute(
+                sql: "UPDATE ticket SET isAssigned = 0 WHERE provider = ? AND id NOT IN (SELECT id FROM syncedTicket)",
+                arguments: [provider.rawValue]
+            )
         }
     }
 
+    /// Tickets to show on the dashboard: currently assigned ones, plus unassigned ones that are
+    /// still mid-workflow so in-progress work never silently disappears.
     public func tickets() async throws -> [Ticket] {
         try await writer.read { db in
-            try Row.fetchAll(db, sql: "SELECT * FROM ticket ORDER BY provider, externalID").map(Self.ticket(from:))
+            try Row.fetchAll(db, sql: """
+                SELECT ticket.* FROM ticket JOIN ticketWorkflow ON ticketWorkflow.ticketID = ticket.id
+                WHERE ticket.isAssigned = 1 OR ticketWorkflow.state NOT IN (\(Self.inactiveStatesSQL))
+                ORDER BY ticket.provider, ticket.source, ticket.externalID
+                """).map(Self.ticket(from:))
         }
     }
+
+    public func unassignedTicketIDs() async throws -> Set<String> {
+        try await writer.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT id FROM ticket WHERE isAssigned = 0"))
+        }
+    }
+
+    /// States in which an unassigned ticket has nothing left to show.
+    private static let inactiveStatesSQL = [WorkflowState.discovered, .cancelled, .rejected, .completeManual]
+        .map { "'\($0.rawValue)'" }
+        .joined(separator: ",")
 
     // MARK: - Workflow state
 
@@ -332,6 +364,7 @@ public final class AppDatabase: Sendable {
         }
         return Ticket(
             provider: provider,
+            source: row["source"],
             externalID: row["externalID"],
             title: row["title"],
             description: row["description"],

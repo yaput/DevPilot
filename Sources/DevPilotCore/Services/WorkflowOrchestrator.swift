@@ -39,10 +39,10 @@ public final class WorkflowOrchestrator: Sendable {
                                 "\(provider.kind.displayName) returned ticket \(foreign.id) from another provider"
                             )
                         }
-                        try await database.upsertTickets(tickets)
+                        try await database.recordSync(tickets, for: provider.kind)
                         return ProviderSyncResult(kind: provider.kind, outcome: .synced(ticketCount: tickets.count), finishedAt: Date())
                     } catch {
-                        return ProviderSyncResult(kind: provider.kind, outcome: .failed(message: String(describing: error)), finishedAt: Date())
+                        return ProviderSyncResult(kind: provider.kind, outcome: .failed(message: error.localizedDescription), finishedAt: Date())
                     }
                 }
             }

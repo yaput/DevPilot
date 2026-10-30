@@ -1,0 +1,49 @@
+{
+  "issues": [
+    {
+      "id": "10001",
+      "key": "PLAT-182",
+      "fields": {
+        "summary": "Rate-limit public API by API key",
+        "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+        "assignee": { "accountId": "abc", "displayName": "Jane Doe" },
+        "description": {
+          "type": "doc", "version": 1,
+          "content": [
+            { "type": "paragraph", "content": [
+              { "type": "text", "text": "Apply a " },
+              { "type": "text", "text": "token-bucket", "marks": [{ "type": "strong" }] },
+              { "type": "text", "text": " limit on " },
+              { "type": "text", "text": "/v1/*", "marks": [{ "type": "code" }] },
+              { "type": "text", "text": ". See " },
+              { "type": "text", "text": "RFC 6585", "marks": [{ "type": "link", "attrs": { "href": "https://www.rfc-editor.org/rfc/rfc6585" } }] },
+              { "type": "text", "text": "." }
+            ]},
+            { "type": "heading", "attrs": { "level": 3 }, "content": [{ "type": "text", "text": "Acceptance Criteria" }] },
+            { "type": "bulletList", "content": [
+              { "type": "listItem", "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "429 with Retry-After when exceeded" }] }] },
+              { "type": "listItem", "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "Limits configurable per plan" }] }] }
+            ]},
+            { "type": "heading", "attrs": { "level": 3 }, "content": [{ "type": "text", "text": "Notes" }] },
+            { "type": "paragraph", "content": [
+              { "type": "mention", "attrs": { "id": "xyz", "text": "@Tech Lead" } },
+              { "type": "text", "text": " prefers Redis." }
+            ]}
+          ]
+        },
+        "comment": {
+          "comments": [
+            {
+              "author": { "displayName": "Tech Lead" },
+              "body": { "type": "doc", "version": 1, "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "Use the existing Redis cluster." }] }] },
+              "created": "2026-10-27T10:15:30.123+0900"
+            }
+          ],
+          "total": 1
+        }
+      }
+    }
+  ],
+  "nextPageToken": "page-2-token",
+  "isLast": false
+}

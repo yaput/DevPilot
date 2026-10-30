@@ -1,0 +1,14 @@
+{
+  "id": 4211,
+  "name": "Add retry with backoff to webhook delivery",
+  "description": "Webhook deliveries fail permanently on the first 5xx.\n\n**Acceptance Criteria:**\n- [ ] Retries on 5xx and timeouts, not on 4xx\n- [ ] Backoff capped at 10 minutes total\n\n## Notes\nSee runbook.",
+  "app_url": "https://app.shortcut.com/acme/story/4211",
+  "workflow_state_id": 500001,
+  "owner_ids": ["m-1"],
+  "archived": false,
+  "comments": [
+    { "author_id": "m-2", "text": "Keep the max total delay under 10 minutes.", "created_at": "2026-10-28T01:15:30Z", "deleted": false },
+    { "author_id": "m-2", "text": null, "created_at": "2026-10-28T02:00:00Z", "deleted": true }
+  ],
+  "tasks": [ { "description": "Add dead-letter table", "complete": false } ]
+}

@@ -11,7 +11,7 @@ struct PersistenceTests {
         // Whole-second timestamp: dates are stored as seconds since 1970, which drops sub-microsecond precision.
         let now = Date(timeIntervalSince1970: 1_790_000_000)
         ticket = try await MockTicketProvider.sample(.jira, now: now).assignedTickets()[0]
-        try await db.upsertTickets([ticket])
+        try await db.recordSync([ticket], for: .jira)
     }
 
     /// Drives the ticket to `awaiting_plan_approval` with the given plan.
@@ -38,11 +38,11 @@ struct PersistenceTests {
     @Test func resyncUpdatesContentButKeepsState() async throws {
         try await db.transition(ticketID: ticket.id, to: .selected, message: "")
         let updated = Ticket(
-            provider: ticket.provider, externalID: ticket.externalID, title: "Renamed", description: ticket.description,
+            provider: ticket.provider, source: ticket.source, externalID: ticket.externalID, title: "Renamed", description: ticket.description,
             status: "In Progress", assignee: ticket.assignee, url: ticket.url, comments: [],
             acceptanceCriteria: ticket.acceptanceCriteria, fetchedAt: Date()
         )
-        try await db.upsertTickets([updated])
+        try await db.recordSync([updated], for: .jira)
         #expect(try await db.tickets().first?.title == "Renamed")
         #expect(try await db.state(of: ticket.id) == .selected)
         #expect(try await db.events(ticketID: ticket.id).count == 2)
@@ -57,8 +57,8 @@ struct PersistenceTests {
     }
 
     @Test func unknownTicketIsRejected() async throws {
-        await #expect(throws: WorkflowError.unknownTicket("jira:NOPE-1")) {
-            try await db.transition(ticketID: "jira:NOPE-1", to: .selected, message: "")
+        await #expect(throws: WorkflowError.unknownTicket("jira:sample/NOPE-1")) {
+            try await db.transition(ticketID: "jira:sample/NOPE-1", to: .selected, message: "")
         }
     }
 
@@ -118,7 +118,7 @@ struct PersistenceTests {
 
     @Test func interruptedRunsAreFailedNotResumed() async throws {
         let others = try await MockTicketProvider.sample(.shortcut).assignedTickets()
-        try await db.upsertTickets(others)
+        try await db.recordSync(others, for: .shortcut)
         try await db.transition(ticketID: ticket.id, to: .selected, message: "")
         try await db.transition(ticketID: ticket.id, to: .investigating, message: "")
 
@@ -130,6 +130,54 @@ struct PersistenceTests {
         #expect(try await db.implementationGate(ticketID: ticket.id) == .blocked(.wrongState(.failed)))
     }
 
+    @Test func ticketsNoLongerReturnedAreHidden() async throws {
+        let all = try await MockTicketProvider.sample(.jira).assignedTickets()
+        try await db.recordSync(all, for: .jira)
+        #expect(try await db.tickets().count == 3)
+
+        try await db.recordSync([all[1]], for: .jira)
+
+        #expect(try await db.tickets().map(\.id) == [all[1].id])
+        #expect(try await db.unassignedTicketIDs() == [all[0].id, all[2].id])
+    }
+
+    @Test func unassignedTicketsStayVisibleWhileInProgress() async throws {
+        try await db.transition(ticketID: ticket.id, to: .selected, message: "")
+        try await db.recordSync([], for: .jira)
+
+        #expect(try await db.tickets().map(\.id) == [ticket.id])
+        #expect(try await db.unassignedTicketIDs() == [ticket.id])
+
+        try await db.transition(ticketID: ticket.id, to: .cancelled, message: "")
+        #expect(try await db.tickets().isEmpty)
+    }
+
+    @Test func syncOnlyAffectsItsOwnProvider() async throws {
+        try await db.recordSync([], for: .shortcut)
+        #expect(try await db.tickets().map(\.id) == [ticket.id])
+    }
+
+    @Test func reassignedTicketReappears() async throws {
+        try await db.recordSync([], for: .jira)
+        try await db.recordSync([ticket], for: .jira)
+        #expect(try await db.unassignedTicketIDs().isEmpty)
+        #expect(try await db.tickets().map(\.id) == [ticket.id])
+    }
+
+    @Test func sameKeyOnDifferentSitesIsTwoTickets() async throws {
+        let otherSite = Ticket(
+            provider: .jira, source: "other.atlassian.net", externalID: ticket.externalID, title: "Unrelated",
+            description: "", status: "To Do", assignee: nil, url: ticket.url, comments: [],
+            acceptanceCriteria: [], fetchedAt: ticket.fetchedAt
+        )
+        try await db.transition(ticketID: ticket.id, to: .selected, message: "")
+        try await db.recordSync([otherSite], for: .jira)
+
+        #expect(try await db.state(of: otherSite.id) == .discovered)
+        #expect(try await db.state(of: ticket.id) == .selected)
+        #expect(Set(try await db.tickets().map(\.id)) == [ticket.id, otherSite.id])
+    }
+
     @Test func dataSurvivesReopeningOnDisk() async throws {
         let url = FileManager.default.temporaryDirectory
             .appending(path: "devpilot-test-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -138,7 +186,7 @@ struct PersistenceTests {
 
         do {
             let first = try AppDatabase.onDisk(at: url)
-            try await first.upsertTickets([ticket])
+            try await first.recordSync([ticket], for: .jira)
             try await first.transition(ticketID: ticket.id, to: .selected, message: "")
         }
         let reopened = try AppDatabase.onDisk(at: url)

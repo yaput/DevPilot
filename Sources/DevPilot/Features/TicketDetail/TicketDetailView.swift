@@ -66,6 +66,7 @@ struct TicketDetailView: View {
             HStack(spacing: 8) {
                 ProviderBadge(provider: ticket.provider)
                 Text(ticket.externalID).font(.callout.monospaced()).foregroundStyle(.secondary)
+                    .help(ticket.source)
                 Text("·").foregroundStyle(.secondary)
                 Text(ticket.status).foregroundStyle(.secondary)
                 Spacer()
@@ -78,6 +79,10 @@ struct TicketDetailView: View {
                 }
                 Text("Fetched \(ticket.fetchedAt.formatted(.relative(presentation: .named)))")
                     .foregroundStyle(.secondary)
+                if model.unassignedIDs.contains(ticket.id) {
+                    Label("No longer assigned to you", systemImage: "person.crop.circle.badge.questionmark")
+                        .foregroundStyle(.orange)
+                }
             }
             .font(.callout)
         }
