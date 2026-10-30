@@ -1,7 +1,7 @@
 import DevPilotCore
 import SwiftUI
 
-/// Settings window. Repositories and Agent tabs are filled in by M3.
+/// Settings window.
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(ProviderSettingsModel.self) private var form
@@ -25,22 +25,14 @@ struct SettingsView: View {
                 .formStyle(.grouped)
             }
             Tab("Repositories", systemImage: "folder") {
-                placeholder("Map Shortcut and Jira projects to local repositories and base branches.", milestone: "M3")
+                RepositoriesSettingsView()
             }
             Tab("Agent", systemImage: "cpu") {
-                placeholder("Codex executable, CLI login check, model, and allowed test/lint commands per repository.", milestone: "M3")
+                AgentSettingsView()
             }
         }
-        .frame(width: 640, height: 640)
+        .frame(width: 680, height: 660)
         .onAppear { form.reset() }
-    }
-
-    private func placeholder(_ text: String, milestone: String) -> some View {
-        ContentUnavailableView {
-            Label("Coming in \(milestone)", systemImage: "hammer")
-        } description: {
-            Text(text)
-        }
     }
 }
 

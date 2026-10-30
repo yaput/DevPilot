@@ -107,25 +107,33 @@ extension JiraSettings {
     }
 }
 
-/// Persists `ProviderSettings` as JSON in UserDefaults.
+/// A settings group stored as JSON under its own UserDefaults key.
+public protocol StoredSettings: Codable, Equatable, Sendable {
+    static var storageKey: String { get }
+    init()
+}
+
+extension ProviderSettings: StoredSettings {
+    public static let storageKey = "providerSettings"
+}
+
+/// Persists settings groups as JSON in UserDefaults. Unreadable data falls back to defaults.
 public struct SettingsStore {
     private let defaults: UserDefaults
-    private let key: String
 
-    public init(defaults: UserDefaults = .standard, key: String = "providerSettings") {
+    public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.key = key
     }
 
-    public func load() -> ProviderSettings {
-        guard let data = defaults.data(forKey: key),
-              let settings = try? JSONDecoder().decode(ProviderSettings.self, from: data) else {
-            return ProviderSettings()
+    public func load<T: StoredSettings>(_ type: T.Type = T.self) -> T {
+        guard let data = defaults.data(forKey: T.storageKey),
+              let settings = try? JSONDecoder().decode(T.self, from: data) else {
+            return T()
         }
         return settings
     }
 
-    public func save(_ settings: ProviderSettings) throws {
-        defaults.set(try JSONEncoder().encode(settings), forKey: key)
+    public func save<T: StoredSettings>(_ settings: T) throws {
+        defaults.set(try JSONEncoder().encode(settings), forKey: T.storageKey)
     }
 }

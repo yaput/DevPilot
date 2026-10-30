@@ -39,13 +39,13 @@ struct SettingsStoreTests {
     @Test func roundTripsAndDefaults() throws {
         let defaults = UserDefaults(suiteName: "devpilot-tests-\(UUID().uuidString)")!
         let store = SettingsStore(defaults: defaults)
-        #expect(store.load() == ProviderSettings())
+        #expect(store.load(ProviderSettings.self) == ProviderSettings())
 
         var settings = ProviderSettings()
         settings.jira.isEnabled = true
         settings.jira.siteURL = "https://acme.atlassian.net"
         try store.save(settings)
-        #expect(store.load() == settings)
+        #expect(store.load(ProviderSettings.self) == settings)
     }
 }
 

@@ -1,20 +1,26 @@
 import CryptoKit
 import Foundation
 
-public struct DecisionDocument: Codable, Sendable, Hashable {
+public struct DecisionDocument: Codable, Sendable, Hashable, Identifiable {
     public let ticketID: String
     public let version: Int
+    /// The exact text the user reviews; `contentHash` covers only this.
     public let markdown: String
     public let contentHash: String
     public let createdAt: Date
+    /// Structured source the Markdown was rendered from, when produced by an agent.
+    public let investigation: Investigation?
 
-    public init(ticketID: String, version: Int, markdown: String, createdAt: Date) {
+    public init(ticketID: String, version: Int, markdown: String, createdAt: Date, investigation: Investigation? = nil) {
         self.ticketID = ticketID
         self.version = version
         self.markdown = markdown
         self.contentHash = Self.hash(markdown)
         self.createdAt = createdAt
+        self.investigation = investigation
     }
+
+    public var id: String { "\(ticketID)#v\(version)" }
 
     public static func hash(_ markdown: String) -> String {
         SHA256.hash(data: Data(markdown.utf8)).map { String(format: "%02x", $0) }.joined()

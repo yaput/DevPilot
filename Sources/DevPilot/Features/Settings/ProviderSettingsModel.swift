@@ -32,16 +32,16 @@ final class ProviderSettingsModel {
         self.store = store
         self.credentials = credentials
         self.factory = factory
-        self.draft = store.load()
+        self.draft = store.load(ProviderSettings.self)
     }
 
     var hasChanges: Bool {
-        draft != store.load() || !shortcutToken.isEmpty || !jiraToken.isEmpty
+        draft != store.load(ProviderSettings.self) || !shortcutToken.isEmpty || !jiraToken.isEmpty
     }
 
     /// Discards unsaved edits; called whenever the Settings window opens.
     func reset() {
-        draft = store.load()
+        draft = store.load(ProviderSettings.self)
         shortcutToken = ""
         jiraToken = ""
         status = [:]

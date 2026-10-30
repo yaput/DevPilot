@@ -13,8 +13,8 @@ DevPilot never commits, pushes, deploys or opens PRs. See
 |---|---|---|
 | M1 | App shell, menu bar, settings shell, mock tickets, SQLite, state machine + tests | Done |
 | M2 | Shortcut and Jira Cloud adapters, configurable URLs, Keychain credentials | Done |
-| M3 | Repo mapping, worktrees, read-only Codex investigation, decision doc, approval UI | Next |
-| M4 | Sandboxed implementation runs, cancellation, budgets | |
+| M3 | Repo mapping, worktrees, read-only Claude Code investigation, decision record, approval | Done |
+| M4 | Sandboxed implementation runs, cancellation, budgets | Next |
 | M5 | Test runner, independent review, diff viewer, notifications | |
 
 ## Requirements
@@ -24,12 +24,15 @@ DevPilot never commits, pushes, deploys or opens PRs. See
   (`sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`). The Command Line
   Tools alone are not enough: they lack the SwiftUI macro plugin needed for `@State`, and
   they fail to load the Swift Testing plugin on some builds.
-- From M3: [Codex CLI](https://github.com/openai/codex), logged in (`codex login`).
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI, logged in with your claude.ai
+  account (run `claude` once in Terminal and log in). DevPilot uses that stored login, never
+  `ANTHROPIC_API_KEY`.
 
 ## Build, run, test
 
 ```bash
 swift test                          # unit tests (DevPilotCore)
+DEVPILOT_LIVE_CLAUDE=1 swift test --filter LiveClaudeTests   # one real Claude run (uses quota)
 swift run DevPilot                  # quick dev run, no app bundle
 scripts/build-app.sh                # build/DevPilot.app, ad-hoc signed
 scripts/build-app.sh --install      # also copy to /Applications
@@ -73,6 +76,32 @@ What gets synced:
 Tokens are stored in the login Keychain under `dev.devpilot.DevPilot`. Non-secret settings are
 stored in `defaults read dev.devpilot.DevPilot providerSettings`.
 
+## Investigating a ticket (M3)
+
+1. **Settings → Repositories → Add Repository…** and pick the repo's top-level folder. DevPilot
+   suggests the base branch from `origin/HEAD`. Optional routing rules map a Jira project key
+   (or all Shortcut stories) to a repository.
+2. **Settings → Agent → Check** confirms Claude Code is found and logged in.
+3. On a ticket: **Select for Investigation**, choose the repository, **Start Investigation**.
+   DevPilot creates a worktree at `~/DevPilot/worktrees/<repo>/<provider>-<ticket>` on branch
+   `devpilot/<provider>-<ticket>`, and Claude investigates it read-only. Progress shows live.
+   **Stop** ends the run, along with everything it started.
+4. Outcomes:
+   - **Needs clarification**: the blocking questions are listed. Answer them in the app (or
+     update the ticket and refresh), then re-investigate. Implementation stays blocked until then.
+   - **Awaiting approval**: **Review Plan…** opens the decision record. Approve, Request Revision
+     (notes go into the next investigation), or Reject. The approval is bound to the SHA-256
+     of the exact text you reviewed.
+
+What "read-only" means here: Claude gets only the Read, Grep and Glob tools, so it has no shell,
+no editing and no web access. Anything else is denied without asking. The repository's own
+`.claude` settings, hooks and MCP servers are ignored, and the process environment contains no
+API keys, SSH agent or cloud credentials. Ticket text and repository files are passed as
+untrusted data. Git hooks are disabled while DevPilot creates worktrees.
+
+Decision records and full agent transcripts (prompt, stream-json, stderr) are kept outside
+every worktree, in `~/Library/Application Support/DevPilot/artifacts/<ticket>/`.
+
 ### Signing
 
 Ad-hoc signing (the default) is enough to run on your own Mac. Because an ad-hoc signature
@@ -103,19 +132,23 @@ Developer ID certificate and notarization.
 
 - `devpilot.sqlite`: tickets, workflow state, approvals and audit trail.
 - `devpilot-sample.sqlite`: used only while *Use sample data* is on. Safe to delete.
+- `artifacts/`: decision records (`decision-vN.md`) and agent transcripts per ticket.
 
 ## Layout
 
 ```
 Sources/DevPilotCore/      domain, integrations, services (no UI; unit-tested)
-  Domain/                  Ticket, WorkflowState, Approval/DecisionDocument/ImplementationGate, WorkflowEvent
+  Domain/                  Ticket, WorkflowState, Approval/DecisionDocument/ImplementationGate, WorkflowEvent,
+                           Investigation, TicketWorkspace, AgentRun
+  Agent/                   AgentRunner protocol, ClaudeCodeRunner, investigation prompt + schema,
+                           decision record renderer
   Integrations/            TicketProvider protocol, Jira and Shortcut adapters, sample provider,
                            HTTP client with retry/backoff, ADF → Markdown, acceptance criteria
-  Services/                AppDatabase (GRDB/SQLite), WorkflowOrchestrator, settings, Keychain,
-                           ProviderFactory
+  Services/                AppDatabase (GRDB/SQLite), WorkflowOrchestrator, InvestigationService,
+                           GitWorktreeManager, ProcessRunner, settings, Keychain, ProviderFactory
 Sources/DevPilot/          SwiftUI app
   App/                     DevPilotApp, AppContainer (composition root), AppModel
-  Features/                Dashboard, TicketDetail, MenuBar, Settings, Components
+  Features/                Dashboard, TicketDetail, Approval, MenuBar, Settings, Components
 Tests/DevPilotCoreTests/   state machine, approval gate, persistence, orchestrator, adapters
   Fixtures/                hand-written Jira and Shortcut API responses (real payload shapes)
 Support/Info.plist         app bundle metadata
@@ -125,11 +158,14 @@ scripts/build-app.sh       bundle + sign
 ## Known TODOs
 
 - Jira scoped API tokens (`api.atlassian.com/ex/jira/{cloudId}`) and OAuth are not supported.
-- Shortcut's `!is:done` search filter has not been checked against a real workspace yet. Stories are
-  re-filtered by workflow state type either way.
 - Sync runs on launch and on Refresh (⌘R) only. Periodic sync is a later addition.
-- Changing settings while an agent run is active must be blocked once M4 adds agent runs.
-- M3: repository mappings, worktree manager (sanitized paths and branches), Codex runner
-  with PATH resolution (GUI apps do not inherit your shell `PATH`), per-repo setup command
-  for dependencies in fresh worktrees.
-- M4/M5: see milestones above and the spec.
+- Worktrees are never deleted automatically. Remove one with `git worktree remove <path>` from
+  the repository once you are done.
+- Worktrees branch from the *local* base branch. Pull it first if you want the latest code.
+- If DevPilot is force-quit mid-run, the Claude process is stopped on normal quit but not on a crash.
+  Investigation is read-only, so an orphaned run cannot change anything. M4 must handle this for
+  write-enabled runs.
+- M4: workspace-write implementation runs (Claude Code sandbox, approved-command allowlist,
+  no git commit/push), per-repo dependency setup command for fresh worktrees, blocking
+  settings changes while a run is active.
+- M5: see milestones above and the spec.

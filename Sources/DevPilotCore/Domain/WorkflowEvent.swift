@@ -5,6 +5,8 @@ public struct WorkflowEvent: Codable, Sendable, Hashable, Identifiable {
     public enum Kind: String, Codable, Sendable {
         case transition
         case approval
+        /// User-supplied answers to clarifying questions, fed into the next investigation.
+        case clarification
     }
 
     public let id: Int64

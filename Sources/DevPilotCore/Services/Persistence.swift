@@ -84,6 +84,35 @@ public final class AppDatabase: Sendable {
                 );
                 """)
         }
+        migrator.registerMigration("v2-workspaces-and-runs") { db in
+            try db.execute(sql: """
+                CREATE TABLE ticketWorkspace (
+                    ticketID TEXT PRIMARY KEY NOT NULL REFERENCES ticket(id),
+                    repositoryID TEXT NOT NULL,
+                    repositoryName TEXT NOT NULL,
+                    repositoryPath TEXT NOT NULL,
+                    baseBranch TEXT NOT NULL,
+                    baseCommit TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    worktreePath TEXT NOT NULL UNIQUE,
+                    createdAt REAL NOT NULL
+                );
+                CREATE TABLE agentRun (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticketID TEXT NOT NULL REFERENCES ticket(id),
+                    kind TEXT NOT NULL,
+                    startedAt REAL NOT NULL,
+                    finishedAt REAL,
+                    outcome TEXT,
+                    numTurns INTEGER,
+                    costUSD REAL,
+                    logPath TEXT NOT NULL,
+                    errorMessage TEXT
+                );
+                CREATE INDEX agentRun_ticketID ON agentRun(ticketID, id);
+                ALTER TABLE decisionDocument ADD COLUMN investigationJSON TEXT;
+                """)
+        }
         return migrator
     }
 
@@ -198,6 +227,10 @@ public final class AppDatabase: Sendable {
             for id in ids {
                 try Self.applyTransition(db, ticketID: id, to: .failed, kind: .transition, message: message)
             }
+            try db.execute(
+                sql: "UPDATE agentRun SET finishedAt = ?, outcome = ?, errorMessage = ? WHERE finishedAt IS NULL",
+                arguments: [Date().timeIntervalSince1970, AgentRun.Outcome.interrupted.rawValue, message]
+            )
             return ids
         }
     }
@@ -225,17 +258,7 @@ public final class AppDatabase: Sendable {
     /// swapped underneath a pending or granted approval.
     public func saveDecisionDocument(ticketID: String, markdown: String) async throws -> DecisionDocument {
         try await writer.write { db in
-            guard let state = try Self.fetchState(db, ticketID: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
-            guard state == .investigating else { throw WorkflowError.decisionDocumentNotAllowed(in: state) }
-            let version = (try Int.fetchOne(
-                db, sql: "SELECT MAX(version) FROM decisionDocument WHERE ticketID = ?", arguments: [ticketID]
-            ) ?? 0) + 1
-            let document = DecisionDocument(ticketID: ticketID, version: version, markdown: markdown, createdAt: Date())
-            try db.execute(
-                sql: "INSERT INTO decisionDocument (ticketID, version, markdown, contentHash, createdAt) VALUES (?, ?, ?, ?, ?)",
-                arguments: [ticketID, version, markdown, document.contentHash, document.createdAt.timeIntervalSince1970]
-            )
-            return document
+            try Self.insertDocument(db, ticketID: ticketID, markdown: markdown, investigation: nil)
         }
     }
 
@@ -290,7 +313,178 @@ public final class AppDatabase: Sendable {
         }
     }
 
+    // MARK: - Workspaces and agent runs
+
+    public func ticket(id: String) async throws -> Ticket? {
+        try await writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM ticket WHERE id = ?", arguments: [id]).map(Self.ticket(from:))
+        }
+    }
+
+    public func workspace(ticketID: String) async throws -> TicketWorkspace? {
+        try await writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM ticketWorkspace WHERE ticketID = ?", arguments: [ticketID]).map { row in
+                TicketWorkspace(
+                    ticketID: row["ticketID"], repositoryID: row["repositoryID"], repositoryName: row["repositoryName"],
+                    repositoryPath: row["repositoryPath"], baseBranch: row["baseBranch"], baseCommit: row["baseCommit"],
+                    branch: row["branch"], worktreePath: row["worktreePath"],
+                    createdAt: Date(timeIntervalSince1970: row["createdAt"])
+                )
+            }
+        }
+    }
+
+    public func saveWorkspace(_ workspace: TicketWorkspace) async throws {
+        try await writer.write { db in
+            try db.execute(
+                sql: """
+                    INSERT OR REPLACE INTO ticketWorkspace
+                        (ticketID, repositoryID, repositoryName, repositoryPath, baseBranch, baseCommit, branch, worktreePath, createdAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                arguments: [
+                    workspace.ticketID, workspace.repositoryID, workspace.repositoryName, workspace.repositoryPath,
+                    workspace.baseBranch, workspace.baseCommit, workspace.branch, workspace.worktreePath,
+                    workspace.createdAt.timeIntervalSince1970,
+                ]
+            )
+        }
+    }
+
+    /// Moves the ticket into `state` and opens a run record in one transaction. The state machine
+    /// makes this the single-flight guard: a second start fails because the ticket is already running.
+    public func beginRun(
+        _ kind: AgentRun.Kind,
+        ticketID: String,
+        entering state: WorkflowState,
+        logPath: String,
+        message: String
+    ) async throws -> Int64 {
+        try await writer.write { db in
+            try Self.applyTransition(db, ticketID: ticketID, to: state, kind: .transition, message: message)
+            try db.execute(
+                sql: "INSERT INTO agentRun (ticketID, kind, startedAt, logPath) VALUES (?, ?, ?, ?)",
+                arguments: [ticketID, kind.rawValue, Date().timeIntervalSince1970, logPath]
+            )
+            return db.lastInsertedRowID
+        }
+    }
+
+    /// Stores the new plan version, closes the run, and moves the ticket to `needs_clarification`
+    /// or `awaiting_plan_approval`, atomically.
+    public func completeInvestigation(
+        runID: Int64,
+        ticketID: String,
+        markdown: String,
+        investigation: Investigation,
+        stats: AgentRunStats
+    ) async throws -> DecisionDocument {
+        try await writer.write { db in
+            let document = try Self.insertDocument(db, ticketID: ticketID, markdown: markdown, investigation: investigation)
+            try Self.closeRun(db, runID: runID, outcome: .succeeded, stats: stats, message: nil)
+            if investigation.needsClarification {
+                let count = investigation.clarifyingQuestions.count
+                try Self.applyTransition(
+                    db, ticketID: ticketID, to: .needsClarification, kind: .transition,
+                    message: "Plan v\(document.version) needs clarification (\(count) question\(count == 1 ? "" : "s"))"
+                )
+            } else {
+                try Self.applyTransition(db, ticketID: ticketID, to: .planReady, kind: .transition, message: "Plan v\(document.version) ready")
+                try Self.applyTransition(db, ticketID: ticketID, to: .awaitingPlanApproval, kind: .transition, message: "Waiting for approval")
+            }
+            return document
+        }
+    }
+
+    /// Closes a run that did not succeed and moves a still-running ticket to `cancelled` or `failed`.
+    public func finishRun(runID: Int64, ticketID: String, outcome: AgentRun.Outcome, message: String) async throws {
+        try await writer.write { db in
+            try Self.closeRun(db, runID: runID, outcome: outcome, stats: nil, message: message)
+            guard try Self.fetchState(db, ticketID: ticketID)?.isAgentRunning == true else { return }
+            try Self.applyTransition(
+                db, ticketID: ticketID, to: outcome == .cancelled ? .cancelled : .failed, kind: .transition, message: message
+            )
+        }
+    }
+
+    public func runs(ticketID: String) async throws -> [AgentRun] {
+        try await writer.read { db in
+            try Row.fetchAll(db, sql: "SELECT * FROM agentRun WHERE ticketID = ? ORDER BY id", arguments: [ticketID]).map { row in
+                AgentRun(
+                    id: row["id"], ticketID: row["ticketID"], kind: AgentRun.Kind(rawValue: row["kind"]) ?? .investigation,
+                    startedAt: Date(timeIntervalSince1970: row["startedAt"]),
+                    finishedAt: (row["finishedAt"] as Double?).map(Date.init(timeIntervalSince1970:)),
+                    outcome: (row["outcome"] as String?).flatMap(AgentRun.Outcome.init(rawValue:)),
+                    numTurns: row["numTurns"], costUSD: row["costUSD"], logPath: row["logPath"], errorMessage: row["errorMessage"]
+                )
+            }
+        }
+    }
+
+    /// Records the user's answers to clarifying questions for the next investigation.
+    public func recordClarification(ticketID: String, answers: String) async throws {
+        try await writer.write { db in
+            guard let state = try Self.fetchState(db, ticketID: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
+            guard state == .needsClarification else { throw WorkflowError.illegalTransition(from: state, to: .investigating) }
+            try Self.insertEvent(db, ticketID: ticketID, kind: .clarification, from: nil, to: nil, message: answers, at: Date())
+        }
+    }
+
+    /// Clarification answers and revision notes, oldest first, to feed into the next investigation.
+    public func guidance(ticketID: String) async throws -> [String] {
+        try await writer.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT text FROM (
+                    SELECT 'Answers to clarifying questions: ' || message AS text, createdAt AS at
+                    FROM workflowEvent WHERE ticketID = ? AND kind = 'clarification'
+                    UNION ALL
+                    SELECT 'Revision requested: ' || notes AS text, decidedAt AS at
+                    FROM approval WHERE ticketID = ? AND decision = ? AND notes != ''
+                ) ORDER BY at
+                """, arguments: [ticketID, ticketID, ApprovalDecision.revisionRequested.rawValue])
+        }
+    }
+
     // MARK: - Helpers (run inside a transaction)
+
+    /// New plan versions are only accepted while investigating, so a plan can never be swapped
+    /// underneath a pending or granted approval.
+    private static func insertDocument(
+        _ db: Database,
+        ticketID: String,
+        markdown: String,
+        investigation: Investigation?
+    ) throws -> DecisionDocument {
+        guard let state = try fetchState(db, ticketID: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
+        guard state == .investigating else { throw WorkflowError.decisionDocumentNotAllowed(in: state) }
+        let version = (try Int.fetchOne(
+            db, sql: "SELECT MAX(version) FROM decisionDocument WHERE ticketID = ?", arguments: [ticketID]
+        ) ?? 0) + 1
+        let document = DecisionDocument(
+            ticketID: ticketID, version: version, markdown: markdown, createdAt: Date(), investigation: investigation
+        )
+        try db.execute(
+            sql: """
+                INSERT INTO decisionDocument (ticketID, version, markdown, contentHash, createdAt, investigationJSON)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+            arguments: [
+                ticketID, version, markdown, document.contentHash, document.createdAt.timeIntervalSince1970,
+                try investigation.map(json),
+            ]
+        )
+        return document
+    }
+
+    private static func closeRun(_ db: Database, runID: Int64, outcome: AgentRun.Outcome, stats: AgentRunStats?, message: String?) throws {
+        try db.execute(
+            sql: """
+                UPDATE agentRun SET finishedAt = ?, outcome = ?, numTurns = ?, costUSD = ?, errorMessage = ?
+                WHERE id = ? AND finishedAt IS NULL
+                """,
+            arguments: [Date().timeIntervalSince1970, outcome.rawValue, stats?.numTurns, stats?.costUSD, message, runID]
+        )
+    }
 
     private static func applyTransition(
         _ db: Database,
@@ -335,7 +529,10 @@ public final class AppDatabase: Sendable {
         ).map { row in
             DecisionDocument(
                 ticketID: row["ticketID"], version: row["version"], markdown: row["markdown"],
-                createdAt: Date(timeIntervalSince1970: row["createdAt"])
+                createdAt: Date(timeIntervalSince1970: row["createdAt"]),
+                investigation: (row["investigationJSON"] as String?).flatMap {
+                    try? JSONDecoder().decode(Investigation.self, from: Data($0.utf8))
+                }
             )
         }
     }
