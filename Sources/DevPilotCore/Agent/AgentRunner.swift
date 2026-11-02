@@ -107,6 +107,17 @@ public protocol AgentRunner: Sendable {
     ) async throws -> (ReviewReport, AgentRunStats)
 }
 
+/// QA sessions drive a browser, which only some runners can.
+public protocol QARunner: Sendable {
+    /// Explores the running app in a browser and reports bugs with replayable reproductions.
+    func exploreQA(
+        _ request: QARequest,
+        onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> (QAReport, AgentRunStats)
+}
+
+extension ClaudeCodeRunner: QARunner {}
+
 public enum AgentError: Error, Equatable, LocalizedError {
     case notConfigured(String)
     case notLoggedIn(String)

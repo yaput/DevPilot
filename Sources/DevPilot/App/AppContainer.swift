@@ -8,7 +8,7 @@ enum AppContainer {
         let settingsStore = SettingsStore()
         let credentials = KeychainCredentialStore(service: Bundle.main.bundleIdentifier ?? "dev.devpilot.DevPilot")
         let factory = ProviderFactory(credentials: credentials, http: URLSessionHTTPClient())
-        let app = AppModel(settingsStore: settingsStore, factory: factory)
+        let app = AppModel(settingsStore: settingsStore, factory: factory, credentials: credentials)
         let settings = ProviderSettingsModel(app: app, store: settingsStore, credentials: credentials, factory: factory)
         return (app, settings)
     }

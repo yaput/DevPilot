@@ -130,7 +130,7 @@ public struct GitWorktreeManager: Sendable {
         }
         let id = switch ticket.provider {
         case .shortcut: "sc-" + slug(ticket.externalID, maxLength: 40)
-        case .jira: refComponent(ticket.externalID, maxLength: 50)
+        case .jira, .local: refComponent(ticket.externalID, maxLength: 50)
         }
         return "\(prefix)/\(id)"
     }

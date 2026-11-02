@@ -160,36 +160,7 @@ public final class AppDatabase: Sendable {
         precondition(tickets.allSatisfy { $0.provider == provider }, "Tickets must belong to \(provider)")
         try await writer.write { db in
             for ticket in tickets {
-                try db.execute(
-                    sql: """
-                        INSERT INTO ticket (id, provider, source, externalID, title, description, status, assignee, url,
-                                            commentsJSON, acceptanceCriteriaJSON, fetchedAt, isAssigned, type)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-                        ON CONFLICT(id) DO UPDATE SET
-                            title = excluded.title, description = excluded.description, status = excluded.status,
-                            assignee = excluded.assignee, url = excluded.url, commentsJSON = excluded.commentsJSON,
-                            acceptanceCriteriaJSON = excluded.acceptanceCriteriaJSON, fetchedAt = excluded.fetchedAt,
-                            isAssigned = 1, type = excluded.type
-                        """,
-                    arguments: [
-                        ticket.id, ticket.provider.rawValue, ticket.source, ticket.externalID, ticket.title,
-                        ticket.description, ticket.status, ticket.assignee, ticket.url.absoluteString,
-                        try Self.json(ticket.comments), try Self.json(ticket.acceptanceCriteria),
-                        ticket.fetchedAt.timeIntervalSince1970, ticket.type.rawValue,
-                    ]
-                )
-                let isNew = try Self.fetchState(db, ticketID: ticket.id) == nil
-                if isNew {
-                    let now = Date()
-                    try db.execute(
-                        sql: "INSERT INTO ticketWorkflow (ticketID, state, updatedAt) VALUES (?, ?, ?)",
-                        arguments: [ticket.id, WorkflowState.discovered.rawValue, now.timeIntervalSince1970]
-                    )
-                    try Self.insertEvent(
-                        db, ticketID: ticket.id, kind: .transition, from: nil, to: .discovered,
-                        message: "Discovered via \(ticket.provider.displayName) sync", at: now
-                    )
-                }
+                try Self.upsert(db, ticket)
             }
             try db.execute(sql: "CREATE TEMP TABLE IF NOT EXISTS syncedTicket (id TEXT PRIMARY KEY)")
             try db.execute(sql: "DELETE FROM syncedTicket")
@@ -200,6 +171,58 @@ public final class AppDatabase: Sendable {
                 sql: "UPDATE ticket SET isAssigned = 0 WHERE provider = ? AND id NOT IN (SELECT id FROM syncedTicket)",
                 arguments: [provider.rawValue]
             )
+        }
+    }
+
+    /// Inserts or updates a ticket (marked assigned); a new one starts in `discovered`.
+    private static func upsert(_ db: Database, _ ticket: Ticket) throws {
+        try db.execute(
+            sql: """
+                INSERT INTO ticket (id, provider, source, externalID, title, description, status, assignee, url,
+                                    commentsJSON, acceptanceCriteriaJSON, fetchedAt, isAssigned, type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title = excluded.title, description = excluded.description, status = excluded.status,
+                    assignee = excluded.assignee, url = excluded.url, commentsJSON = excluded.commentsJSON,
+                    acceptanceCriteriaJSON = excluded.acceptanceCriteriaJSON, fetchedAt = excluded.fetchedAt,
+                    isAssigned = 1, type = excluded.type
+                """,
+            arguments: [
+                ticket.id, ticket.provider.rawValue, ticket.source, ticket.externalID, ticket.title,
+                ticket.description, ticket.status, ticket.assignee, ticket.url.absoluteString,
+                try Self.json(ticket.comments), try Self.json(ticket.acceptanceCriteria),
+                ticket.fetchedAt.timeIntervalSince1970, ticket.type.rawValue,
+            ]
+        )
+        let isNew = try Self.fetchState(db, ticketID: ticket.id) == nil
+        if isNew {
+            let now = Date()
+            try db.execute(
+                sql: "INSERT INTO ticketWorkflow (ticketID, state, updatedAt) VALUES (?, ?, ?)",
+                arguments: [ticket.id, WorkflowState.discovered.rawValue, now.timeIntervalSince1970]
+            )
+            try Self.insertEvent(
+                db, ticketID: ticket.id, kind: .transition, from: nil, to: .discovered,
+                message: ticket.provider == .local ? "Created in DevPilot" : "Discovered via \(ticket.provider.displayName) sync", at: now
+            )
+        }
+    }
+
+    /// A ticket written in DevPilot for `repositoryID`, numbered DP-1, DP-2, … per database.
+    public func addLocalTicket(
+        title: String, description: String, acceptanceCriteria: [String], type: TicketType, repositoryID: String
+    ) async throws -> Ticket {
+        try await writer.write { db in
+            let used = try String.fetchAll(db, sql: "SELECT externalID FROM ticket WHERE provider = ?", arguments: [TicketProviderKind.local.rawValue])
+            let next = (used.compactMap { Int($0.split(separator: "-").last ?? "") }.max() ?? 0) + 1
+            let externalID = "DP-\(next)"
+            let ticket = Ticket(
+                provider: .local, source: repositoryID, externalID: externalID, title: title, description: description,
+                status: "Open", assignee: nil, url: URL(string: "devpilot://ticket/\(externalID)")!, comments: [],
+                acceptanceCriteria: acceptanceCriteria, fetchedAt: Date(), type: type
+            )
+            try Self.upsert(db, ticket)
+            return ticket
         }
     }
 

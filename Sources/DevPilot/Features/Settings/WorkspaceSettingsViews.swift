@@ -9,6 +9,7 @@ struct RepositoriesSettingsView: View {
     @State private var error: String?
     @State private var isAdding = false
     @State private var configuringID: String?
+    @State private var configuringLocalRunID: String?
 
     var body: some View {
         Form {
@@ -37,6 +38,8 @@ struct RepositoriesSettingsView: View {
                             Spacer()
                             Button("Configure Commands…") { configuringID = repository.id }
                                 .controlSize(.small)
+                            Button("Configure Local Run…") { configuringLocalRunID = repository.id }
+                                .controlSize(.small)
                         }
                     }
                     .padding(.vertical, 2)
@@ -58,7 +61,7 @@ struct RepositoriesSettingsView: View {
                 ForEach($draft.rules) { $rule in
                     HStack {
                         Picker("Provider", selection: $rule.provider) {
-                            ForEach(TicketProviderKind.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                            ForEach(TicketProviderKind.synced, id: \.self) { Text($0.displayName).tag($0) }
                         }
                         .labelsHidden()
                         .frame(width: 110)
@@ -110,6 +113,11 @@ struct RepositoriesSettingsView: View {
                 RepositoryCommandsSheet(repository: $draft.repositories[index])
             }
         }
+        .sheet(isPresented: Binding(get: { configuringLocalRunID != nil }, set: { if !$0 { configuringLocalRunID = nil } })) {
+            if let index = draft.repositories.firstIndex(where: { $0.id == configuringLocalRunID }) {
+                LocalRunSheet(repository: $draft.repositories[index])
+            }
+        }
     }
 
     private func commandSummary(_ repository: RepositoryConfig) -> String {
@@ -142,13 +150,21 @@ struct RepositoriesSettingsView: View {
                     return
                 }
                 let presets = CommandPresets.detect(repositoryAt: inspection.topLevel)
-                draft.repositories.append(RepositoryConfig(
+                var repository = RepositoryConfig(
                     name: URL(filePath: inspection.topLevel).lastPathComponent,
                     path: inspection.topLevel,
                     baseBranch: inspection.defaultBranch ?? "main",
                     setupCommands: presets.setup,
-                    agentCommands: presets.agent
-                ))
+                    agentCommands: presets.agent,
+                    validationCommands: presets.validation
+                )
+                let (localRun, secrets) = LocalRunPresets.detect(repositoryAt: inspection.topLevel)
+                repository.localRun = localRun
+                repository.qa.login = LoginPresets.detect(repositoryAt: inspection.topLevel)
+                for (name, value) in secrets {
+                    model.setRepositorySecret(repository.id, name, value: value)
+                }
+                draft.repositories.append(repository)
             } catch {
                 self.error = error.localizedDescription
             }
@@ -219,6 +235,21 @@ struct AgentSettingsView: View {
                     the repository's own .claude settings, hooks and MCP servers are ignored.
                     """)
             }
+            .disabled(model.hasActiveRuns)
+            Section {
+                Stepper(value: $draft.maxParallelInvestigations, in: 1...8) {
+                    Text("Parallel investigations: \(draft.maxParallelInvestigations)")
+                }
+                .help("Investigations mostly wait on Claude and use little of your Mac.")
+                Stepper(value: $draft.maxParallelBuilds, in: 1...4) {
+                    Text("Parallel builds (implement, test, review): \(draft.maxParallelBuilds)")
+                }
+                .help("Each runs Gradle/pnpm builds and tests locally; about 2–4 GB each. Extra runs wait in a queue.")
+            } header: {
+                Text("Parallel runs")
+            } footer: {
+                Text("Can be changed while runs are active; queued runs start as soon as a slot is free.")
+            }
             Section {
                 TextField("PATH", text: $draft.toolPath, prompt: Text("Imported from your login shell on first implementation"), axis: .vertical)
                     .font(.callout.monospaced())
@@ -239,9 +270,9 @@ struct AgentSettingsView: View {
                     Only PATH and JAVA_HOME are imported; nothing else from your shell profile is passed to builds.
                     """)
             }
+            .disabled(model.hasActiveRuns)
         }
         .formStyle(.grouped)
-        .disabled(model.hasActiveRuns)
         .onAppear { draft = model.agentSettings }
         .onChange(of: draft) {
             model.applyAgentSettings(draft)
@@ -304,7 +335,7 @@ private struct RepositoryCommandsSheet: View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    CommandList(rules: $repository.setupCommands, placeholder: "e.g. pnpm install --frozen-lockfile")
+                    CommandList(rules: $repository.setupCommands, placeholder: "e.g. pnpm install --frozen-lockfile", allowsOptional: true)
                 } header: {
                     Text("Setup commands")
                 } footer: {
@@ -365,6 +396,8 @@ private struct RepositoryCommandsSheet: View {
 private struct CommandList: View {
     @Binding var rules: [CommandRule]
     let placeholder: String
+    /// Setup commands can be optional: a failure is a warning, not a stop.
+    var allowsOptional = false
 
     var body: some View {
         if rules.isEmpty {
@@ -377,6 +410,11 @@ private struct CommandList: View {
                     .font(.callout.monospaced())
                     .labelsHidden()
                     .foregroundStyle(rule.isEnabled ? .primary : .secondary)
+                if allowsOptional {
+                    Toggle("Optional", isOn: $rule.isOptional)
+                        .toggleStyle(.checkbox)
+                        .help("If this command fails, DevPilot logs a warning and continues instead of stopping.")
+                }
                 Button(role: .destructive) { rules.removeAll { $0.id == rule.id } } label: { Image(systemName: "minus.circle") }
                     .buttonStyle(.borderless)
             }

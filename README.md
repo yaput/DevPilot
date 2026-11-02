@@ -156,6 +156,18 @@ Edit them in Settings → Repositories → *Configure Commands…*.
 Notifications: plan ready, clarification needed, ready for review, failed. Clicking one selects
 the ticket.
 
+## Several tickets at once
+
+Select several tickets on the dashboard (⌘-click, ⇧-click or ⌘A) and click **Investigate N
+Tickets**; each uses the repository its routing rule suggests. Any number of tickets can be in
+flight, but only so many run at the same time (Settings → Agent → *Parallel runs*):
+investigations (default 4) mostly wait on Claude, while builds (implementation, tests and
+review; default 2) load the Mac. Extra runs show as *Queued #N* and start as soon as a slot is
+free; they can be cancelled while waiting, and the limits can be changed while runs are active.
+
+Gradle runs with the build cache on (`-Dorg.gradle.caching=true`, stored in `~/.gradle`), so a
+new worktree reuses outputs already built in another one.
+
 **Per-repository commands:** Settings → Repositories → *Configure Commands…*. Detected
 automatically from build files (top level and up to two folders down, for monorepos): Maven,
 Gradle, npm, pnpm, yarn. Everything starts checked; uncheck what you don't want. Some commands

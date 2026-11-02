@@ -71,7 +71,11 @@ public final class ImplementationService: Sendable {
             let setupLog = logURL.deletingPathExtension().appendingPathExtension("setup.log")
             for rule in repository.setupCommands where rule.isEnabled && fixInstructions == nil {
                 onEvent(.progress("Setup: \(rule.command)"))
-                try await runSetup(rule.command, in: workspace.worktreePath, tools: tools, log: setupLog)
+                do {
+                    try await runSetup(rule.command, in: workspace.worktreePath, tools: tools, log: setupLog)
+                } catch ImplementationError.setupFailed(let command, let detail) where rule.isOptional {
+                    onEvent(.progress("Optional setup failed, continuing: `\(command)` (\(detail.prefix(160)))"))
+                }
             }
 
             let request = ImplementationRequest(

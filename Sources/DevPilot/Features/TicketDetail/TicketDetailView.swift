@@ -53,11 +53,16 @@ struct TicketDetailView: View {
             }
             Text(ticket.title).font(.title2.weight(.semibold))
             HStack(spacing: 16) {
-                Link(destination: ticket.url) {
-                    Label("Open in \(ticket.provider.displayName)", systemImage: "arrow.up.right.square")
+                if ticket.provider == .local {
+                    Label("Created in DevPilot \(ticket.fetchedAt.formatted(.relative(presentation: .named)))", systemImage: "square.and.pencil")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Link(destination: ticket.url) {
+                        Label("Open in \(ticket.provider.displayName)", systemImage: "arrow.up.right.square")
+                    }
+                    Text("Fetched \(ticket.fetchedAt.formatted(.relative(presentation: .named)))")
+                        .foregroundStyle(.secondary)
                 }
-                Text("Fetched \(ticket.fetchedAt.formatted(.relative(presentation: .named)))")
-                    .foregroundStyle(.secondary)
                 if model.unassignedIDs.contains(ticket.id) {
                     Label("No longer assigned to you", systemImage: "person.crop.circle.badge.questionmark")
                         .foregroundStyle(.orange)
@@ -92,6 +97,10 @@ private struct WorkflowPanel: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
                 repositoryRow
+                if let workspace = detail.workspace, FileManager.default.fileExists(atPath: workspace.worktreePath) {
+                    LocalRunPanel(ticket: ticket, workspace: workspace)
+                    QASessionPanel(ticket: ticket, workspace: workspace)
+                }
                 Divider()
                 stateContent
                 if canStartOver {
@@ -238,6 +247,16 @@ private struct WorkflowPanel: View {
 
     @ViewBuilder
     private var stateContent: some View {
+        if model.activity[ticket.id]?.queuedPosition != nil {
+            // Waiting for a free slot; the ticket has not moved yet.
+            RunProgress(ticketID: ticket.id)
+        } else {
+            stateSpecificContent
+        }
+    }
+
+    @ViewBuilder
+    private var stateSpecificContent: some View {
         switch state {
         case .discovered:
             HStack {
@@ -314,7 +333,7 @@ private struct WorkflowPanel: View {
 
     private var implementForm: some View {
         let repository = effectiveRepositoryID.flatMap(model.workspaceSettings.repository(id:))
-        let setup = repository?.setupCommands.filter(\.isEnabled).map(\.command) ?? []
+        let setup = repository?.setupCommands.filter(\.isEnabled).map { $0.command + ($0.isOptional ? " (optional)" : "") } ?? []
         let commands = repository?.agentCommands.filter(\.isEnabled).map(\.command) ?? []
         return VStack(alignment: .leading, spacing: 8) {
             Label("Plan v\(detail.document?.version ?? 0) approved.", systemImage: "checkmark.seal.fill")
@@ -415,7 +434,15 @@ private struct RunProgress: View {
     }
 
     var body: some View {
-        if let activity = model.activity[ticketID] {
+        if let activity = model.activity[ticketID], let position = activity.queuedPosition {
+            HStack {
+                Image(systemName: "hourglass")
+                Text("Queued (#\(position)): waiting for a free \(activity.kind == .investigation ? "investigation" : "build") slot.")
+                Spacer()
+                Button("Cancel", role: .destructive) { model.stopRun(ticketID) }
+            }
+            .foregroundStyle(.secondary)
+        } else if let activity = model.activity[ticketID] {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     ProgressView().controlSize(.small)

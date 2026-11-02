@@ -5,11 +5,23 @@ public struct CommandRule: Codable, Sendable, Hashable, Identifiable {
     public var id: String
     public var command: String
     public var isEnabled: Bool
+    /// Setup only: a failure is logged as a warning and the run continues (e.g. installing a
+    /// package the app does not need to run).
+    public var isOptional: Bool
 
-    public init(id: String = UUID().uuidString, command: String, isEnabled: Bool = true) {
+    public init(id: String = UUID().uuidString, command: String, isEnabled: Bool = true, isOptional: Bool = false) {
         self.id = id
         self.command = command
         self.isEnabled = isEnabled
+        self.isOptional = isOptional
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        command = try container.decode(String.self, forKey: .command)
+        isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
+        isOptional = try container.decodeIfPresent(Bool.self, forKey: .isOptional) ?? false
     }
 }
 
@@ -28,6 +40,10 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
     /// Full commands DevPilot runs (sandboxed) after implementation to verify the change, e.g.
     /// `cd services/ui && pnpm test`. Each must exit 0 to pass.
     public var validationCommands: [CommandRule]
+    /// How to run the app locally for manual and QA testing.
+    public var localRun: LocalRunConfig
+    /// Signing in for QA sessions against the local run.
+    public var qa: QAConfig
 
     public init(
         id: String = UUID().uuidString, name: String, path: String, baseBranch: String,
@@ -40,6 +56,8 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
         self.setupCommands = setupCommands
         self.agentCommands = agentCommands
         self.validationCommands = validationCommands
+        self.localRun = LocalRunConfig()
+        self.qa = QAConfig()
     }
 
     public init(from decoder: Decoder) throws {
@@ -51,6 +69,8 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
         setupCommands = try container.decodeIfPresent([CommandRule].self, forKey: .setupCommands) ?? []
         agentCommands = try container.decodeIfPresent([CommandRule].self, forKey: .agentCommands) ?? []
         validationCommands = try container.decodeIfPresent([CommandRule].self, forKey: .validationCommands) ?? []
+        localRun = try container.decodeIfPresent(LocalRunConfig.self, forKey: .localRun) ?? LocalRunConfig()
+        qa = try container.decodeIfPresent(QAConfig.self, forKey: .qa) ?? QAConfig()
     }
 }
 
@@ -113,6 +133,17 @@ public enum CommandPresets {
                 add("gradle")
             }
             if isJava { add("java") }
+            if has("Gemfile") {
+                setup.append(cd + "bundle install")
+                add("bundle")
+                add("ruby")
+                if has("bin/rails") { add("bin/rails") }
+                if has(".rspec") || has("spec") {
+                    validation.append(cd + "bundle exec rspec")
+                } else if has("test") && has("bin/rails") {
+                    validation.append(cd + "bin/rails test")
+                }
+            }
             if has("package.json") {
                 let runner: String
                 if has("pnpm-lock.yaml") {
@@ -137,15 +168,19 @@ public enum CommandPresets {
             }
         }
         (gitInspection + shellUtilities).forEach(add)
+        // Browser end-to-end suites need a running app, so they cannot pass as validation.
+        let needsRunningApp = { (command: String) in
+            ["e2e", "playwright", "cypress"].contains { command.hasPrefix("cd \($0) ") || command.contains("/\($0) ") }
+        }
         return (
             setup.map { CommandRule(command: $0) },
             agent.map { CommandRule(command: $0) },
-            validation.map { CommandRule(command: $0) }
+            validation.map { CommandRule(command: $0, isEnabled: !needsRunningApp($0)) }
         )
     }
 
     /// Script names declared in a package.json; empty if it can't be read.
-    static func packageScripts(at url: URL) -> Set<String> {
+    public static func packageScripts(at url: URL) -> Set<String> {
         guard let data = try? Data(contentsOf: url),
               let json = try? JSONDecoder().decode(JSONValue.self, from: data),
               case .object(let scripts)? = json["scripts"] else { return [] }
@@ -153,18 +188,26 @@ public enum CommandPresets {
     }
 
     private static let buildFiles = [
-        "mvnw", "pom.xml", "gradlew", "build.gradle", "build.gradle.kts", "package.json",
+        "mvnw", "pom.xml", "gradlew", "build.gradle", "build.gradle.kts", "package.json", "Gemfile",
     ]
     private static let skippedFolders: Set<String> = [
         "node_modules", "build", "dist", "target", "out", "vendor", "docs", "test", "tests", "src",
     ]
 
     /// Relative paths of folders that hold a build file: "" for the top level, then up to two
-    /// levels down. A project's own sub-folders (e.g. Gradle modules) are not listed separately.
+    /// levels down. When the top level is itself a project, sub-folders count only if they use a
+    /// different ecosystem (a Node `frontend/` under a Rails app), so a project's own modules
+    /// (Gradle sub-projects, pnpm workspace packages) are not listed separately.
     public static func projectDirectories(in root: URL) -> [String] {
         let fileManager = FileManager.default
+        func ecosystems(_ relative: String) -> Set<String> {
+            let ecosystemFiles = ["java": ["mvnw", "pom.xml", "gradlew", "build.gradle", "build.gradle.kts"], "node": ["package.json"], "ruby": ["Gemfile"]]
+            return Set(ecosystemFiles.filter { _, files in
+                files.contains { fileManager.fileExists(atPath: root.appending(path: relative).appending(path: $0).path) }
+            }.keys)
+        }
         func isProject(_ relative: String) -> Bool {
-            buildFiles.contains { fileManager.fileExists(atPath: root.appending(path: relative).appending(path: $0).path) }
+            !ecosystems(relative).isEmpty
         }
         func subfolders(_ relative: String) -> [String] {
             let url = relative.isEmpty ? root : root.appending(path: relative)
@@ -175,14 +218,15 @@ public enum CommandPresets {
                     && fileManager.fileExists(atPath: url.appending(path: name).path, isDirectory: &isDirectory) && isDirectory.boolValue
             }.map { relative.isEmpty ? $0 : "\(relative)/\($0)" }
         }
-        if isProject("") { return [""] }
-        var projects: [String] = []
+        let topLevel = ecosystems("")
+        var projects = topLevel.isEmpty ? [] : [""]
+        let isSeparateProject = { (relative: String) in isProject(relative) && !ecosystems(relative).isSubset(of: topLevel) }
         for first in subfolders("") {
             if isProject(first) {
-                projects.append(first)
+                if isSeparateProject(first) { projects.append(first) }
                 continue
             }
-            projects += subfolders(first).filter(isProject)
+            projects += subfolders(first).filter(isSeparateProject)
         }
         return projects
     }
@@ -240,6 +284,7 @@ public struct WorkspaceSettings: StoredSettings {
 
     /// Project-key rule, then provider default, then the only repository if there is just one.
     public func suggestedRepository(for ticket: Ticket) -> RepositoryConfig? {
+        if ticket.provider == .local { return repository(id: ticket.source) }
         let key = Self.projectKey(of: ticket)
         let providerRules = rules.filter { $0.provider == ticket.provider }
         let match = providerRules.first { !$0.projectKey.isEmpty && $0.projectKey.caseInsensitiveCompare(key ?? "") == .orderedSame }
@@ -270,6 +315,10 @@ public struct AgentSettings: StoredSettings {
     public var validationTimeoutMinutes = 20
     /// How many times Claude may automatically try to fix failing validation before hand-off.
     public var automaticFixAttempts = 1
+    /// Investigations mostly wait on Claude, so several can run at once.
+    public var maxParallelInvestigations = 4
+    /// Implementation, tests and review build and run code locally: heavy on CPU and memory.
+    public var maxParallelBuilds = 2
     /// PATH and JAVA_HOME for build tools, imported from the login shell (GUI apps don't get them).
     public var toolPath = ""
     public var javaHome = ""
@@ -285,6 +334,8 @@ public struct AgentSettings: StoredSettings {
         implementationTimeoutMinutes = try container.decodeIfPresent(Int.self, forKey: .implementationTimeoutMinutes) ?? implementationTimeoutMinutes
         validationTimeoutMinutes = try container.decodeIfPresent(Int.self, forKey: .validationTimeoutMinutes) ?? validationTimeoutMinutes
         automaticFixAttempts = try container.decodeIfPresent(Int.self, forKey: .automaticFixAttempts) ?? automaticFixAttempts
+        maxParallelInvestigations = try container.decodeIfPresent(Int.self, forKey: .maxParallelInvestigations) ?? maxParallelInvestigations
+        maxParallelBuilds = try container.decodeIfPresent(Int.self, forKey: .maxParallelBuilds) ?? maxParallelBuilds
         toolPath = try container.decodeIfPresent(String.self, forKey: .toolPath) ?? toolPath
         javaHome = try container.decodeIfPresent(String.self, forKey: .javaHome) ?? javaHome
     }

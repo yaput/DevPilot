@@ -166,6 +166,107 @@ public enum ProcessRunner {
         return killpg(group, SIGKILL) == 0
     }
 
+    /// Starts a long-running process (e.g. a dev server) in its own process group, unsandboxed,
+    /// with stdout and stderr appended to `logURL`. It runs until `terminate()` or app quit.
+    public static func start(
+        executable: URL,
+        arguments: [String],
+        workingDirectory: URL,
+        environment: [String: String],
+        logURL: URL
+    ) throws -> BackgroundProcess {
+        let path = executable.path
+        guard FileManager.default.isExecutableFile(atPath: path) else { throw ProcessRunnerError.notExecutable(path) }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: workingDirectory.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw ProcessRunnerError.missingWorkingDirectory(workingDirectory.path)
+        }
+        signal(SIGPIPE, SIG_IGN)
+        try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        }
+        let log = try FileHandle(forWritingTo: logURL)
+        _ = try? log.seekToEnd()
+
+        let stdinPipe = try makePipe(path)
+        let outputPipe = try makePipe(path)
+        let request = ProcessRequest(
+            executable: executable, arguments: arguments, workingDirectory: workingDirectory,
+            environment: environment, timeout: .seconds(0)
+        )
+        let pid: pid_t
+        do {
+            pid = try spawn(request, stdin: stdinPipe.read, stdout: outputPipe.write, stderr: outputPipe.write)
+        } catch {
+            [stdinPipe.read, stdinPipe.write, outputPipe.read, outputPipe.write].forEach { close($0) }
+            try? log.close()
+            throw error
+        }
+        close(stdinPipe.read)
+        close(stdinPipe.write)  // No input: the child sees EOF.
+        close(outputPipe.write)
+        liveGroups.withLock { _ = $0.insert(pid) }
+
+        let process = BackgroundProcess(pid: pid, logURL: logURL)
+        let outputFD = outputPipe.read
+        DispatchQueue.global().async {
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            while true {
+                let count = read(outputFD, &buffer, buffer.count)
+                if count < 0 && errno == EINTR { continue }
+                if count <= 0 { break }
+                try? log.write(contentsOf: Data(buffer[0..<count]))
+            }
+            close(outputFD)
+            try? log.close()
+        }
+        DispatchQueue.global().async {
+            var status: Int32 = 0
+            while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+            killpg(pid, SIGKILL)  // Anything the service left behind in its group.
+            liveGroups.withLock { _ = $0.remove(pid) }
+            process.markExited(decode(status))
+        }
+        return process
+    }
+
+    /// Kills a process group left over from a previous app session, identified by when it
+    /// started rather than its command line (which `exec` can rewrite): only if the group still
+    /// exists, does not include DevPilot itself, and every member started no earlier than
+    /// `startedAt` (minus a second of clock slack). A recycled group ID belongs to a newer process
+    /// and therefore never matches.
+    @discardableResult
+    public static func terminateOrphanedGroup(_ group: pid_t, startedAt: Date) async -> Bool {
+        guard group > 1, group != getpgrp() else { return false }
+        let environment = ["PATH": "/usr/bin:/bin"]
+        let root = URL(filePath: "/", directoryHint: .isDirectory)
+        guard let members = try? await run(ProcessRequest(
+            executable: URL(filePath: "/usr/bin/pgrep"), arguments: ["-g", String(group)],
+            workingDirectory: root, environment: environment, timeout: .seconds(10)
+        )), members.succeeded else { return false }
+        let pids = members.stdoutText.split(whereSeparator: \.isNewline).map(String.init)
+        guard !pids.isEmpty, let elapsed = try? await run(ProcessRequest(
+            executable: URL(filePath: "/bin/ps"), arguments: ["-o", "etime=", "-p", pids.joined(separator: ",")],
+            workingDirectory: root, environment: environment, timeout: .seconds(10)
+        )) else { return false }
+        let now = Date()
+        let starts = elapsed.stdoutText.split(whereSeparator: \.isNewline).compactMap { parseElapsed(String($0)) }.map { now.addingTimeInterval(-$0) }
+        guard !starts.isEmpty, starts.allSatisfy({ $0 >= startedAt.addingTimeInterval(-1) }) else { return false }
+        return killpg(group, SIGKILL) == 0
+    }
+
+    /// `ps` etime: `[[dd-]hh:]mm:ss` → seconds.
+    static func parseElapsed(_ text: String) -> TimeInterval? {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        let dayParts = trimmed.split(separator: "-")
+        let days = dayParts.count == 2 ? Double(dayParts[0]) ?? 0 : 0
+        let clock = (dayParts.last ?? "").split(separator: ":").compactMap { Double($0) }
+        guard (2...3).contains(clock.count) else { return nil }
+        let seconds = clock.reversed().enumerated().reduce(0.0) { $0 + $1.element * pow(60, Double($1.offset)) }
+        return days * 86_400 + seconds
+    }
+
     // MARK: - Internals
 
     private static func spawn(_ request: ProcessRequest, stdin: Int32, stdout: Int32, stderr: Int32) throws -> pid_t {
@@ -280,5 +381,43 @@ public enum ProcessRunner {
                 continuation.resume(returning: captured)
             }
         }
+    }
+}
+
+/// A long-running child started by `ProcessRunner.start`.
+public final class BackgroundProcess: Sendable {
+    public let pid: pid_t
+    public let logURL: URL
+    private let exit = Mutex<ProcessResult.Termination?>(nil)
+
+    init(pid: pid_t, logURL: URL) {
+        self.pid = pid
+        self.logURL = logURL
+    }
+
+    public var termination: ProcessResult.Termination? { exit.withLock { $0 } }
+    public var isRunning: Bool { termination == nil }
+
+    func markExited(_ termination: ProcessResult.Termination) {
+        exit.withLock { $0 = termination }
+    }
+
+    /// SIGTERM to the whole group, then SIGKILL after `grace`.
+    public func terminate(grace: Duration = .seconds(10)) async {
+        if isRunning {
+            killpg(pid, SIGTERM)
+            let deadline = ContinuousClock.now + grace
+            while isRunning && ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        if isRunning { killpg(pid, SIGKILL) }
+        while isRunning { try? await Task.sleep(for: .milliseconds(50)) }
+    }
+
+    /// The last lines of the log, for error messages.
+    public func logTail(lines: Int = 25) -> String {
+        guard let text = try? String(contentsOf: logURL, encoding: .utf8) else { return "" }
+        return text.split(separator: "\n", omittingEmptySubsequences: false).suffix(lines).joined(separator: "\n")
     }
 }

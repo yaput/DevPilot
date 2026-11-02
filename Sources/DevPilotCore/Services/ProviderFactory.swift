@@ -14,7 +14,7 @@ public struct ProviderFactory: Sendable {
     /// `UnconfiguredTicketProvider`, so the problem is visible in sync status.
     public func makeProviders(_ settings: ProviderSettings) -> [any TicketProvider] {
         if settings.useSampleData {
-            return TicketProviderKind.allCases.map { MockTicketProvider.sample($0) }
+            return TicketProviderKind.synced.map { MockTicketProvider.sample($0) }
         }
         var providers: [any TicketProvider] = []
         if settings.shortcut.isEnabled {
@@ -34,6 +34,8 @@ public struct ProviderFactory: Sendable {
                 let apiURL = try ProviderURL.normalize(settings.shortcut.apiURL, field: "Shortcut API URL")
                 let token = try resolveToken(token, account: .shortcutToken, name: "Shortcut API token")
                 return ShortcutTicketProvider(apiURL: apiURL, apiToken: token, http: http)
+            case .local:
+                throw SettingsError.missing("a tracker: local tickets are created in DevPilot")
             case .jira:
                 let siteURL = try ProviderURL.normalize(settings.jira.siteURL, field: "Jira site URL")
                 let email = settings.jira.email.trimmingCharacters(in: .whitespaces)

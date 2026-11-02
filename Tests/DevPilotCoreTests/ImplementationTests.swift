@@ -122,6 +122,24 @@ struct ImplementationServiceTests {
         #expect(try String(contentsOf: setupLog, encoding: .utf8).contains("registry unreachable"))
     }
 
+    @Test func optionalSetupFailureIsAWarning() async throws {
+        let fixture = try await ApprovedTicket()
+        defer { fixture.repo.remove() }
+        let runner = FakeAgentRunner()
+        var config = fixture.repo.config
+        config.setupCommands = [
+            CommandRule(command: "echo 'lockfile mismatch' >&2; exit 1", isOptional: true),
+            CommandRule(command: "touch required-ran"),
+        ]
+        let progress = Mutex<[String]>([])
+        _ = try await fixture.service(runner).implement(ticketID: fixture.ticket.id, repository: config, tools: tools) { event in
+            if case .progress(let message) = event { progress.withLock { $0.append(message) } }
+        }
+        #expect(runner.implementations.count == 1)
+        #expect(FileManager.default.fileExists(atPath: fixture.worktree.appending(path: "required-ran").path))
+        #expect(progress.withLock { $0 }.contains { $0.contains("Optional setup failed, continuing") && $0.contains("lockfile mismatch") })
+    }
+
     @Test func commitsByTheAgentAreDetected() async throws {
         let fixture = try await ApprovedTicket()
         defer { fixture.repo.remove() }

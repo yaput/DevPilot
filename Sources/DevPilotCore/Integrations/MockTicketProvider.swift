@@ -34,6 +34,8 @@ extension MockTicketProvider {
             TicketComment(author: author, body: body, createdAt: now.addingTimeInterval(-daysAgo * 86_400))
         }
         switch kind {
+        case .local:
+            return MockTicketProvider(kind: .local, tickets: [])
         case .shortcut:
             let story = { (id: String, type: TicketType, title: String, description: String, status: String, comments: [TicketComment], criteria: [String]) in
                 Ticket(

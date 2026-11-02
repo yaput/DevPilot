@@ -120,7 +120,7 @@ final class ProviderSettingsModel {
     }
 
     private func refreshStoredTokens() {
-        storedTokens = Set(CredentialAccount.allCases.filter { account in
+        storedTokens = Set(CredentialAccount.providerTokens.filter { account in
             (try? credentials.secret(for: account))??.isEmpty == false
         })
     }
@@ -131,6 +131,7 @@ extension TicketProviderKind {
         switch self {
         case .shortcut: .shortcutToken
         case .jira: .jiraToken
+        case .local: CredentialAccount(rawValue: "local.none")  // Local tickets have no token.
         }
     }
 }

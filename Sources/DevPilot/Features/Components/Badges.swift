@@ -29,6 +29,7 @@ extension TicketProviderKind {
         switch self {
         case .shortcut: .purple
         case .jira: .blue
+        case .local: .teal
         }
     }
 }

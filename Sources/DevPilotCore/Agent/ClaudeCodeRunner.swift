@@ -125,16 +125,46 @@ public struct ClaudeCodeRunner: AgentRunner {
             + ["--settings", sandbox]
     }
 
+    // MARK: - QA
+
+    public func exploreQA(
+        _ request: QARequest,
+        onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> (QAReport, AgentRunStats) {
+        try await run(
+            arguments: qaArguments(request),
+            prompt: QAPrompt.render(request),
+            worktree: request.workspace.worktreePath,
+            environment: Self.environment(),
+            // The agent is asked to finish within the limit; this is the hard stop.
+            timeout: .seconds((request.timeLimitMinutes + 5) * 60),
+            logURL: request.logURL,
+            onLaunch: request.onLaunch,
+            onProgress: onProgress
+        )
+    }
+
+    /// Browser tools from DevPilot's Playwright MCP server (an explicit list), plus reading the
+    /// worktree and the run's logs, but never the saved sign-in session.
+    func qaArguments(_ request: QARequest) -> [String] {
+        var arguments = common(schema: QAPrompt.schema, policy: QAPrompt.policy, mcpConfig: request.mcpConfigPath)
+        arguments += ["--tools", "Read,Grep,Glob"]
+        arguments += ["--allowedTools", Self.within("Read", request.workspace.worktreePath), Self.within("Read", request.logDirectory)]
+            + QAPrompt.browserTools.map { "mcp__playwright__\($0)" }
+        arguments += ["--disallowedTools", Self.within("Read", request.excludedDirectory), "mcp__playwright__browser_run_code_unsafe"]
+        return arguments
+    }
+
     // MARK: - Shared
 
-    private func common(schema: String, policy: String) -> [String] {
+    private func common(schema: String, policy: String, mcpConfig: String = #"{"mcpServers":{}}"#) -> [String] {
         var arguments = [
             "-p",
             "--output-format", "stream-json", "--verbose",
             "--json-schema", schema,
             "--permission-mode", "dontAsk",
             "--setting-sources", "",
-            "--strict-mcp-config", "--mcp-config", #"{"mcpServers":{}}"#,
+            "--strict-mcp-config", "--mcp-config", mcpConfig,
             "--no-session-persistence",
             "--append-system-prompt", policy,
         ]
@@ -264,12 +294,28 @@ public struct ClaudeCodeRunner: AgentRunner {
                     let command = (input?["command"]?.string ?? "").replacingOccurrences(of: "\n", with: " ")
                     return "Running `\(command.count > 100 ? command.prefix(100) + "…" : command)`"
                 case "StructuredOutput": return "Writing the report"
+                case let name? where name.hasPrefix("mcp__playwright__browser_"):
+                    return browserProgress(String(name.dropFirst("mcp__playwright__browser_".count)), input: input)
                 case let name?: return "Using \(name)"
                 case nil: return nil
                 }
             }
         default:
             return []
+        }
+    }
+
+    static func browserProgress(_ tool: String, input: JSONValue?) -> String {
+        let element = input?["element"]?.string.map { " “\($0.prefix(60))”" } ?? ""
+        switch tool {
+        case "navigate": return "Browser: opening \(input?["url"]?.string ?? "a page")"
+        case "click": return "Browser: clicking\(element)"
+        case "type", "fill_form", "press_sequentially": return "Browser: typing\(element)"
+        case "snapshot": return "Browser: reading the page"
+        case "take_screenshot": return "Browser: taking a screenshot"
+        case "console_messages": return "Browser: checking console messages"
+        case "network_requests", "network_request": return "Browser: checking network requests"
+        default: return "Browser: \(tool.replacingOccurrences(of: "_", with: " "))\(element)"
         }
     }
 }

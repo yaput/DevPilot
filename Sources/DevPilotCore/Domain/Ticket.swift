@@ -3,11 +3,18 @@ import Foundation
 public enum TicketProviderKind: String, Codable, Sendable, CaseIterable, Comparable {
     case shortcut
     case jira
+    /// Written in DevPilot itself (for trying things out, or work with no tracker ticket). Never
+    /// synced; `source` is the repository ID the ticket belongs to.
+    case local
+
+    /// Providers that are synced from a tracker.
+    public static let synced: [TicketProviderKind] = [.shortcut, .jira]
 
     public var displayName: String {
         switch self {
         case .shortcut: "Shortcut"
         case .jira: "Jira"
+        case .local: "DevPilot"
         }
     }
 
