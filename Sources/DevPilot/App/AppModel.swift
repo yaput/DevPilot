@@ -860,11 +860,15 @@ final class AppModel {
             }
             continuation.finish()
             await consumer.value
-            runTasks[ticketID] = nil
-            activity[ticketID] = nil
-            await reload()
-            detailRevision += 1
-            notifyOutcome(ticketID)
+            // From a fresh task: after Stop this one is cancelled, and GRDB refuses to read from
+            // a cancelled task, so reload() would fail with CancellationError.
+            await Task {
+                runTasks[ticketID] = nil
+                activity[ticketID] = nil
+                await reload()
+                detailRevision += 1
+                notifyOutcome(ticketID)
+            }.value
         }
     }
 
