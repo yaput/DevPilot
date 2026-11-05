@@ -20,16 +20,19 @@ public final class QAService: Sendable {
     private let worktrees: GitWorktreeManager
     private let runner: any QARunner
     private let artifacts: ArtifactStore
+    public let memory: QAMemoryStore
 
     public init(database: AppDatabase, worktrees: GitWorktreeManager, runner: any QARunner, artifacts: ArtifactStore) {
         self.database = database
         self.worktrees = worktrees
         self.runner = runner
         self.artifacts = artifacts
+        memory = QAMemoryStore(artifacts: artifacts)
     }
 
     public func run(
         ticketID: String,
+        repositoryName: String,
         localRun: LocalRunStatus,
         signIn: LoginResult?,
         qaTools: QATools,
@@ -58,6 +61,7 @@ public final class QAService: Sendable {
             serviceLogs: localRun.services.map { ($0.name, $0.logPath) }, logDirectory: localRun.logDirectory,
             excludedDirectory: localRun.qaLoginDirectory.path, mcpConfigPath: mcpConfig.path,
             sessionDirectory: session.path, timeLimitMinutes: timeLimitMinutes,
+            memory: memory.read(repositoryID: workspace.repositoryID),
             logURL: session.appending(path: "agent.jsonl")
         )
         onProgress("QA agent started (up to \(timeLimitMinutes) minutes)")
@@ -88,7 +92,29 @@ public final class QAService: Sendable {
         try QAReportRenderer.render(result, ticket: ticket, workspace: workspace, appURL: appURL)
             .write(to: reportURL, atomically: true, encoding: .utf8)
         try encoder.encode(result).write(to: session.appending(path: "session.json"))
+        await updateMemory(after: result, ticket: ticket, repositoryID: workspace.repositoryID, repositoryName: repositoryName, onProgress: onProgress)
         return result
+    }
+
+    /// Best effort: a failed update keeps the old notes and never fails the session.
+    private func updateMemory(
+        after result: QASessionResult, ticket: Ticket, repositoryID: String, repositoryName: String,
+        onProgress: @Sendable (String) -> Void
+    ) async {
+        onProgress("Updating QA notes for the next session")
+        let request = QAMemoryRequest(
+            repositoryName: repositoryName, previous: memory.read(repositoryID: repositoryID) ?? "", ticket: ticket,
+            session: result, workingDirectory: result.directory,
+            logURL: URL(filePath: result.directory).appending(path: "memory.jsonl")
+        )
+        do {
+            let (update, _) = try await runner.updateQAMemory(request)
+            try memory.write(update.memory, repositoryID: repositoryID)
+        } catch is CancellationError {
+            return
+        } catch {
+            onProgress("QA notes were not updated: \(error.localizedDescription)")
+        }
     }
 
     /// Past sessions of a ticket, newest first.

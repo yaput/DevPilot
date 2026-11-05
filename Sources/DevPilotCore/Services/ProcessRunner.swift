@@ -12,6 +12,12 @@ public struct ProcessRequest: Sendable {
     public var timeout: Duration
     /// Called with the child's PID (which is also its process group ID) once it has started.
     public var onLaunch: (@Sendable (pid_t) -> Void)?
+    /// Agents, builds and tests run at utility QoS: macOS favours the efficiency cores for them
+    /// and keeps the performance cores for the apps in use. nil leaves the default.
+    public var qualityOfService: qos_class_t?
+    /// Stops the child when it writes nothing (stdout or stderr) for this long, so a stuck process
+    /// ends early while a busy one may use all of `timeout`.
+    public var idleTimeout: Duration?
 
     public init(
         executable: URL,
@@ -20,8 +26,12 @@ public struct ProcessRequest: Sendable {
         environment: [String: String],
         stdin: Data? = nil,
         timeout: Duration,
-        onLaunch: (@Sendable (pid_t) -> Void)? = nil
+        onLaunch: (@Sendable (pid_t) -> Void)? = nil,
+        qualityOfService: qos_class_t? = QOS_CLASS_UTILITY,
+        idleTimeout: Duration? = nil
     ) {
+        self.idleTimeout = idleTimeout
+        self.qualityOfService = qualityOfService
         self.executable = executable
         self.arguments = arguments
         self.workingDirectory = workingDirectory
@@ -42,6 +52,8 @@ public struct ProcessResult: Sendable {
     public let stdout: Data
     public let stderr: Data
     public let timedOut: Bool
+    /// Stopped by `idleTimeout` (also sets `timedOut`).
+    public let stalled: Bool
 
     public var succeeded: Bool { termination == .exited(0) && !timedOut }
     public var stdoutText: String { String(decoding: stdout, as: UTF8.self) }
@@ -117,12 +129,26 @@ public enum ProcessRunner {
             close(stdinFD)
         }
 
-        async let stdout = readAll(stdoutPipe.read, onLine: onStdoutLine)
-        async let stderr = readAll(stderrPipe.read, onLine: nil)
+        let lastOutput = Mutex(ContinuousClock.now)
+        let noteOutput: @Sendable () -> Void = { lastOutput.withLock { $0 = .now } }
+        async let stdout = readAll(stdoutPipe.read, onLine: onStdoutLine, onOutput: noteOutput)
+        async let stderr = readAll(stderrPipe.read, onLine: nil, onOutput: noteOutput)
 
         let timedOut = Mutex(false)
+        let stalled = Mutex(false)
         let timeoutTask = Task {
-            try await Task.sleep(for: request.timeout)
+            let deadline = ContinuousClock.now + request.timeout
+            if let idle = request.idleTimeout {
+                while ContinuousClock.now < deadline {
+                    if ContinuousClock.now - lastOutput.withLock({ $0 }) >= idle {
+                        stalled.withLock { $0 = true }
+                        break
+                    }
+                    try await Task.sleep(for: min(.seconds(5), idle / 4, deadline - .now))
+                }
+            } else {
+                try await Task.sleep(for: request.timeout)
+            }
             timedOut.withLock { $0 = true }
             terminateGroup(pid)
         }
@@ -140,7 +166,8 @@ public enum ProcessRunner {
             termination: decode(status),
             stdout: await stdout,
             stderr: await stderr,
-            timedOut: timedOut.withLock { $0 }
+            timedOut: timedOut.withLock { $0 },
+            stalled: stalled.withLock { $0 }
         )
         try Task.checkCancellation()
         return result
@@ -191,9 +218,10 @@ public enum ProcessRunner {
 
         let stdinPipe = try makePipe(path)
         let outputPipe = try makePipe(path)
+        // The user is clicking through these services, so they keep the default QoS.
         let request = ProcessRequest(
             executable: executable, arguments: arguments, workingDirectory: workingDirectory,
-            environment: environment, timeout: .seconds(0)
+            environment: environment, timeout: .seconds(0), qualityOfService: nil
         )
         let pid: pid_t
         do {
@@ -289,6 +317,9 @@ public enum ProcessRunner {
         posix_spawnattr_setsigmask(&attributes, &noSignals)
         var allSignals = ~sigset_t()
         posix_spawnattr_setsigdefault(&attributes, &allSignals)
+        if let qos = request.qualityOfService {
+            posix_spawnattr_set_qos_class_np(&attributes, qos)
+        }
 
         let path = request.executable.path
         let argv = ([path] + request.arguments).map { strdup($0) } + [nil]
@@ -352,7 +383,7 @@ public enum ProcessRunner {
     }
 
     /// Reads until EOF, keeping at most `maxCapturedBytes` and reporting complete lines as they arrive.
-    private static func readAll(_ fd: Int32, onLine: (@Sendable (String) -> Void)?) async -> Data {
+    private static func readAll(_ fd: Int32, onLine: (@Sendable (String) -> Void)?, onOutput: @escaping @Sendable () -> Void) async -> Data {
         await withCheckedContinuation { continuation in
             DispatchQueue.global().async {
                 var captured = Data()
@@ -362,6 +393,7 @@ public enum ProcessRunner {
                     let count = read(fd, &buffer, buffer.count)
                     if count < 0 && errno == EINTR { continue }
                     if count <= 0 { break }
+                    onOutput()
                     let chunk = buffer[0..<count]
                     if captured.count < maxCapturedBytes {
                         captured.append(contentsOf: chunk.prefix(maxCapturedBytes - captured.count))

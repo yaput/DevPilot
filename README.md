@@ -35,6 +35,8 @@ swift test                          # unit tests (DevPilotCore)
 DEVPILOT_LIVE_CLAUDE=1 swift test --filter LiveClaudeTests   # real Claude runs (uses quota): read-only
                                                              # investigation + sandboxed implementation that must not commit
 swift run DevPilot                  # quick dev run, no app bundle
+scripts/run-isolated.sh --snapshot  # dev copy next to the installed app: own data, settings and
+                                    # Keychain, seeded with a snapshot of your real tickets
 scripts/build-app.sh                # build/DevPilot.app, ad-hoc signed
 scripts/build-app.sh --install      # also copy to /Applications
 open build/DevPilot.app

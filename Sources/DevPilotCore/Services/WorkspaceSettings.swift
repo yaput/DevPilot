@@ -44,6 +44,8 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
     public var localRun: LocalRunConfig
     /// Signing in for QA sessions against the local run.
     public var qa: QAConfig
+    /// Steps DevPilot takes on its own for this repository's tickets.
+    public var autopilot: AutopilotConfig
 
     public init(
         id: String = UUID().uuidString, name: String, path: String, baseBranch: String,
@@ -58,6 +60,7 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
         self.validationCommands = validationCommands
         self.localRun = LocalRunConfig()
         self.qa = QAConfig()
+        self.autopilot = AutopilotConfig()
     }
 
     public init(from decoder: Decoder) throws {
@@ -71,6 +74,27 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
         validationCommands = try container.decodeIfPresent([CommandRule].self, forKey: .validationCommands) ?? []
         localRun = try container.decodeIfPresent(LocalRunConfig.self, forKey: .localRun) ?? LocalRunConfig()
         qa = try container.decodeIfPresent(QAConfig.self, forKey: .qa) ?? QAConfig()
+        autopilot = try container.decodeIfPresent(AutopilotConfig.self, forKey: .autopilot) ?? AutopilotConfig()
+    }
+}
+
+/// Hands-off steps for one repository. Approving a plan always stays with the user.
+public struct AutopilotConfig: Codable, Sendable, Hashable {
+    /// When set, tickets discovered from this moment on and not touched since are investigated
+    /// as soon as they arrive. Tickets that were already there are left alone, so turning this on
+    /// never spends Claude usage on the whole backlog.
+    public var investigateNewSince: Date?
+    /// Approving a plan starts its implementation (and then tests and review) right away.
+    public var implementWhenApproved = false
+
+    public init() {}
+
+    public var investigatesNewTickets: Bool { investigateNewSince != nil }
+
+    /// Whether a ticket discovered at `discoveredAt` is one autopilot should investigate.
+    public func shouldInvestigate(discoveredAt: Date) -> Bool {
+        guard let investigateNewSince else { return false }
+        return discoveredAt >= investigateNewSince
     }
 }
 
@@ -310,18 +334,22 @@ public struct AgentSettings: StoredSettings {
     /// Model alias or ID. Empty means the account default.
     public var model = ""
     public var investigationTimeoutMinutes = 20
-    public var implementationTimeoutMinutes = 30
+    /// A safety cap: a stuck implementation is stopped sooner, after 15 minutes without output.
+    public var implementationTimeoutMinutes = 90
     /// Per validation command.
     public var validationTimeoutMinutes = 20
     /// How many times Claude may automatically try to fix failing validation before hand-off.
     public var automaticFixAttempts = 1
-    /// Investigations mostly wait on Claude, so several can run at once.
-    public var maxParallelInvestigations = 4
-    /// Implementation, tests and review build and run code locally: heavy on CPU and memory.
+    /// Tickets with a run in progress (investigation, implementation, tests, review). The agent
+    /// mostly waits on Claude, so this is about Claude usage more than the Mac.
+    public var maxParallelAgents = 4
+    /// Setup and validation commands running at once: the CPU- and memory-heavy part.
     public var maxParallelBuilds = 2
     /// PATH and JAVA_HOME for build tools, imported from the login shell (GUI apps don't get them).
     public var toolPath = ""
     public var javaHome = ""
+    /// Bumped when a default changes, so values saved with the old default follow it.
+    public var limitsVersion = 2
 
     public init() {}
 
@@ -332,9 +360,16 @@ public struct AgentSettings: StoredSettings {
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? model
         investigationTimeoutMinutes = try container.decodeIfPresent(Int.self, forKey: .investigationTimeoutMinutes) ?? investigationTimeoutMinutes
         implementationTimeoutMinutes = try container.decodeIfPresent(Int.self, forKey: .implementationTimeoutMinutes) ?? implementationTimeoutMinutes
+        // Version 1 stopped busy agents at the 30-minute default; now inactivity stops stuck ones.
+        if (try container.decodeIfPresent(Int.self, forKey: .limitsVersion) ?? 1) < 2 && implementationTimeoutMinutes == 30 {
+            implementationTimeoutMinutes = 90
+        }
         validationTimeoutMinutes = try container.decodeIfPresent(Int.self, forKey: .validationTimeoutMinutes) ?? validationTimeoutMinutes
         automaticFixAttempts = try container.decodeIfPresent(Int.self, forKey: .automaticFixAttempts) ?? automaticFixAttempts
-        maxParallelInvestigations = try container.decodeIfPresent(Int.self, forKey: .maxParallelInvestigations) ?? maxParallelInvestigations
+        // Before agent runs shared one limit, it was for investigations only.
+        let legacy = try decoder.container(keyedBy: LegacyKeys.self)
+        maxParallelAgents = try container.decodeIfPresent(Int.self, forKey: .maxParallelAgents)
+            ?? legacy.decodeIfPresent(Int.self, forKey: .maxParallelInvestigations) ?? maxParallelAgents
         maxParallelBuilds = try container.decodeIfPresent(Int.self, forKey: .maxParallelBuilds) ?? maxParallelBuilds
         toolPath = try container.decodeIfPresent(String.self, forKey: .toolPath) ?? toolPath
         javaHome = try container.decodeIfPresent(String.self, forKey: .javaHome) ?? javaHome
@@ -342,5 +377,9 @@ public struct AgentSettings: StoredSettings {
 
     public var toolEnvironment: ToolEnvironment {
         ToolEnvironment(path: toolPath, javaHome: javaHome)
+    }
+
+    private enum LegacyKeys: String, CodingKey {
+        case maxParallelInvestigations
     }
 }

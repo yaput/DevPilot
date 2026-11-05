@@ -106,6 +106,8 @@ public struct AgentRun: Sendable, Hashable, Identifiable {
         /// Test/lint/typecheck commands run by DevPilot (not an agent) in the sandbox.
         case validation
         case review
+        /// A QA session in the pipeline: the app run locally and explored in a browser.
+        case qa
     }
 
     public enum Outcome: String, Codable, Sendable {
@@ -126,18 +128,24 @@ public struct AgentRun: Sendable, Hashable, Identifiable {
     public let costUSD: Double?
     public let logPath: String
     public let errorMessage: String?
+    /// The agent session kept for implementation runs, to continue one that was stopped.
+    public let sessionID: String?
     /// Set for implementation runs that finished.
     public let implementation: ImplementationResult?
     /// Set for validation runs that finished.
     public let validation: ValidationResult?
     /// Set for review runs that finished.
     public let review: ReviewReport?
+    /// Set for pipeline QA runs that finished.
+    public let qa: QASessionResult?
 
     public init(
         id: Int64, ticketID: String, kind: Kind, startedAt: Date, finishedAt: Date?, outcome: Outcome?,
-        numTurns: Int?, costUSD: Double?, logPath: String, errorMessage: String?,
-        implementation: ImplementationResult? = nil, validation: ValidationResult? = nil, review: ReviewReport? = nil
+        numTurns: Int?, costUSD: Double?, logPath: String, errorMessage: String?, sessionID: String? = nil,
+        implementation: ImplementationResult? = nil, validation: ValidationResult? = nil, review: ReviewReport? = nil,
+        qa: QASessionResult? = nil
     ) {
+        self.qa = qa
         self.id = id
         self.ticketID = ticketID
         self.kind = kind
@@ -148,6 +156,7 @@ public struct AgentRun: Sendable, Hashable, Identifiable {
         self.costUSD = costUSD
         self.logPath = logPath
         self.errorMessage = errorMessage
+        self.sessionID = sessionID
         self.implementation = implementation
         self.validation = validation
         self.review = review

@@ -114,11 +114,12 @@ private struct FileRow: View {
     let file: FileDiff
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             Text(badge.letter)
-                .font(.caption.monospaced().weight(.bold))
+                .font(.caption2.monospaced().weight(.bold))
                 .foregroundStyle(badge.color)
-                .frame(width: 14)
+                .frame(width: 20, height: 20)
+                .background(badge.color.opacity(0.15), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
                 .help(file.change.rawValue)
             VStack(alignment: .leading, spacing: 1) {
                 Text(URL(filePath: file.path).lastPathComponent).lineLimit(1)
@@ -150,13 +151,21 @@ private struct DiffView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 10) {
+                Image(systemName: "doc.text").foregroundStyle(.secondary)
                 Text(file.oldPath.map { "\($0) → \(file.path)" } ?? file.path)
                     .font(.callout.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.head)
                     .textSelection(.enabled)
                 Spacer()
+                if !file.isBinary {
+                    Pill(text: "+\(file.additions)", tint: .green)
+                    Pill(text: "−\(file.deletions)", tint: .red)
+                }
             }
-            .padding(10)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
             .background(.bar)
             Divider()
             if file.isBinary {
@@ -168,7 +177,7 @@ private struct DiffView: View {
                     ScrollView([.vertical, .horizontal]) {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(Array(file.lines.enumerated()), id: \.offset) { _, line in
-                                DiffLineRow(line: line).frame(minWidth: proxy.size.width, alignment: .leading)
+                                DiffLineRow(line: line, minWidth: proxy.size.width)
                             }
                             if file.isTruncated {
                                 Text("Diff truncated after \(UnifiedDiffParser.maxLinesPerFile) lines. Open the file in your editor for the rest.")
@@ -178,6 +187,8 @@ private struct DiffView: View {
                             }
                         }
                         .textSelection(.enabled)
+                        .padding(.vertical, 6)
+                        .frame(minWidth: proxy.size.width, minHeight: proxy.size.height, alignment: .topLeading)
                     }
                 }
             }
@@ -187,9 +198,14 @@ private struct DiffView: View {
 
 private struct DiffLineRow: View {
     let line: FileDiff.Line
+    /// The visible width, so highlights span the whole row and not just the text.
+    let minWidth: CGFloat
 
     var body: some View {
         HStack(spacing: 0) {
+            Rectangle()
+                .fill(marker)
+                .frame(width: 3)
             number(line.oldNumber)
             number(line.newNumber)
             Text(sign)
@@ -202,7 +218,16 @@ private struct DiffLineRow: View {
         }
         .font(.system(.callout, design: .monospaced))
         .padding(.vertical, 1)
+        .frame(minWidth: minWidth, alignment: .leading)
         .background(background)
+    }
+
+    private var marker: Color {
+        switch line.kind {
+        case .addition: .green
+        case .deletion: .red
+        default: .clear
+        }
     }
 
     private func number(_ value: Int?) -> some View {

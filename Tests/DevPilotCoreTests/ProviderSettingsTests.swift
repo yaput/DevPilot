@@ -110,3 +110,16 @@ struct ProviderFactoryTests {
         #expect(provider is ShortcutTicketProvider)
     }
 }
+
+struct SyncIntervalSettingsTests {
+    @Test func settingsSavedBeforeBackgroundSyncGetTheDefault() throws {
+        let old = try JSONDecoder().decode(ProviderSettings.self, from: Data(#"{"useSampleData": false}"#.utf8))
+        #expect(old.syncIntervalMinutes == 15)
+
+        var off = ProviderSettings()
+        off.syncIntervalMinutes = 0
+        let roundTrip = try JSONDecoder().decode(ProviderSettings.self, from: JSONEncoder().encode(off))
+        #expect(roundTrip.syncIntervalMinutes == 0)
+        #expect(ProviderSettings.syncIntervalChoices.contains(ProviderSettings().syncIntervalMinutes))
+    }
+}

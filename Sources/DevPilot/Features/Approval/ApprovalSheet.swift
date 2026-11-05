@@ -12,6 +12,8 @@ struct ApprovalSheet: View {
     @State private var notes = ""
     @State private var confirmingReject = false
     @State private var isSubmitting = false
+    /// Autopilot: approving starts the implementation right away.
+    @State private var implementsOnApproval = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,7 +48,8 @@ struct ApprovalSheet: View {
                     Button("Reject…", role: .destructive) { confirmingReject = true }
                     Button("Request Revision") { submit(.revisionRequested) }
                         .disabled(trimmedNotes.isEmpty)
-                    Button("Approve Plan") { submit(.approved) }
+                    Button(implementsOnApproval ? "Approve & Implement" : "Approve Plan") { submit(.approved) }
+                        .help(implementsOnApproval ? "Autopilot is on for this repository: implementation, tests and review start right away." : "")
                         .buttonStyle(.borderedProminent)
                 }
                 .disabled(isSubmitting)
@@ -54,6 +57,7 @@ struct ApprovalSheet: View {
             .padding(16)
         }
         .frame(width: 760, height: 720)
+        .task { implementsOnApproval = await model.implementsOnApproval(ticket.id) }
         .confirmationDialog("Reject this plan?", isPresented: $confirmingReject) {
             Button("Reject Plan", role: .destructive) { submit(.rejected) }
         } message: {

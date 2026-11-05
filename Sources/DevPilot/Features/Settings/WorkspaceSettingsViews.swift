@@ -41,6 +41,7 @@ struct RepositoriesSettingsView: View {
                             Button("Configure Local Run…") { configuringLocalRunID = repository.id }
                                 .controlSize(.small)
                         }
+                        AutopilotToggles(autopilot: $repository.autopilot)
                     }
                     .padding(.vertical, 2)
                 }
@@ -220,6 +221,7 @@ struct AgentSettingsView: View {
                 Stepper(value: $draft.implementationTimeoutMinutes, in: 5...180, step: 5) {
                     Text("Implementation time limit: \(draft.implementationTimeoutMinutes) min")
                 }
+                .help("A safety cap. Claude is stopped sooner if it produces no output for 15 minutes; a stopped run can be continued in the same session.")
                 Stepper(value: $draft.validationTimeoutMinutes, in: 1...120, step: 1) {
                     Text("Time limit per validation command: \(draft.validationTimeoutMinutes) min")
                 }
@@ -237,18 +239,21 @@ struct AgentSettingsView: View {
             }
             .disabled(model.hasActiveRuns)
             Section {
-                Stepper(value: $draft.maxParallelInvestigations, in: 1...8) {
-                    Text("Parallel investigations: \(draft.maxParallelInvestigations)")
+                Stepper(value: $draft.maxParallelAgents, in: 1...8) {
+                    Text("Tickets Claude works on at once: \(draft.maxParallelAgents)")
                 }
-                .help("Investigations mostly wait on Claude and use little of your Mac.")
+                .help("Investigation, implementation and review mostly wait on Claude. More at once uses your Claude usage faster.")
                 Stepper(value: $draft.maxParallelBuilds, in: 1...4) {
-                    Text("Parallel builds (implement, test, review): \(draft.maxParallelBuilds)")
+                    Text("Builds and tests at once: \(draft.maxParallelBuilds)")
                 }
-                .help("Each runs Gradle/pnpm builds and tests locally; about 2–4 GB each. Extra runs wait in a queue.")
+                .help("Setup and test commands run locally, about 2–4 GB each. They also wait while macOS reports memory pressure.")
             } header: {
                 Text("Parallel runs")
             } footer: {
-                Text("Can be changed while runs are active; queued runs start as soon as a slot is free.")
+                Text("""
+                    Can be changed while runs are active. A ticket waits only for its build and test commands, not \
+                    for whole runs, and those run at low priority so the apps you use stay responsive.
+                    """)
             }
             Section {
                 TextField("PATH", text: $draft.toolPath, prompt: Text("Imported from your login shell on first implementation"), axis: .vertical)
@@ -327,6 +332,35 @@ struct AgentSettingsView: View {
 }
 
 /// Per-repository command lists: everything detected starts checked; uncheck what isn't needed.
+/// A repository's autopilot switches. Plan approval always stays with the user.
+private struct AutopilotToggles: View {
+    @Binding var autopilot: AutopilotConfig
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: Binding(
+                get: { autopilot.investigatesNewTickets },
+                // Only tickets from now on: the backlog is never picked up.
+                set: { autopilot.investigateNewSince = $0 ? Date() : nil }
+            )) {
+                Label("Investigate new tickets automatically", systemImage: "magnifyingglass")
+            }
+            .help("Tickets that arrive from now on are investigated as soon as they sync (every 5 minutes). Tickets already here are left alone.")
+            Toggle(isOn: $autopilot.implementWhenApproved) {
+                Label("Implement as soon as I approve a plan", systemImage: "hammer")
+            }
+            .help("Approving a plan starts implementation, then tests and review. You still approve every plan.")
+            if let since = autopilot.investigateNewSince {
+                Text("Autopilot investigates tickets that arrived after \(since.formatted(date: .abbreviated, time: .shortened)).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .controlSize(.small)
+        .padding(.top, 2)
+    }
+}
+
 private struct RepositoryCommandsSheet: View {
     @Binding var repository: RepositoryConfig
     @Environment(\.dismiss) private var dismiss
@@ -346,7 +380,7 @@ private struct RepositoryCommandsSheet: View {
                 } header: {
                     Text("Validation commands")
                 } footer: {
-                    Text("Run by DevPilot after every implementation and fix, in the sandbox (no network, writes only in the worktree and build caches). Each must exit 0. Results go to the reviewer and to you.")
+                    Text("Run by DevPilot after every implementation and fix, in the sandbox (no network, writes only in the worktree and build caches). Each must exit 0. Results go to the reviewer and to you. $DEVPILOT_CHANGED_FILES lists the files the ticket changed (one per line) and $DEVPILOT_BASE_COMMIT its starting commit, to test only what changed, e.g. pnpm vitest related --run $DEVPILOT_CHANGED_FILES.")
                 }
                 Section {
                     CommandList(rules: $repository.agentCommands, placeholder: "e.g. ./mvnw or pnpm")

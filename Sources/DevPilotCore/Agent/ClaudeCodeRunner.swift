@@ -19,12 +19,22 @@ public struct ClaudeCodeRunner: AgentRunner {
     private let model: String?
     private let investigationTimeout: Duration
     private let implementationTimeout: Duration
+    /// An implementation that streams nothing for this long is stuck; a busy one may use all of
+    /// `implementationTimeout`. Longer than any single build or test command it would wait on.
+    private let implementationIdleTimeout: Duration
+    /// Receives the plan usage Claude Code reports while it runs.
+    private let onUsage: (@Sendable (ClaudeUsage) -> Void)?
 
-    public init(executable: URL, model: String?, investigationTimeout: Duration, implementationTimeout: Duration) {
+    public init(
+        executable: URL, model: String?, investigationTimeout: Duration, implementationTimeout: Duration,
+        implementationIdleTimeout: Duration = .seconds(15 * 60), onUsage: (@Sendable (ClaudeUsage) -> Void)? = nil
+    ) {
+        self.onUsage = onUsage
         self.executable = executable
         self.model = model?.trimmingCharacters(in: .whitespaces).isEmpty == false ? model : nil
         self.investigationTimeout = investigationTimeout
         self.implementationTimeout = implementationTimeout
+        self.implementationIdleTimeout = implementationIdleTimeout
     }
 
     // MARK: - Investigation
@@ -60,10 +70,11 @@ public struct ClaudeCodeRunner: AgentRunner {
     ) async throws -> (ImplementationReport, AgentRunStats) {
         try await run(
             arguments: implementationArguments(request),
-            prompt: ImplementationPrompt.render(request),
+            prompt: request.continuesSession ? ImplementationPrompt.continuation(request) : ImplementationPrompt.render(request),
             worktree: request.workspace.worktreePath,
             environment: request.tools.variables(base: Self.environment()),
             timeout: implementationTimeout,
+            idleTimeout: implementationIdleTimeout,
             logURL: request.logURL,
             onLaunch: request.onLaunch,
             onProgress: onProgress
@@ -83,8 +94,12 @@ public struct ClaudeCodeRunner: AgentRunner {
             commonGitDirectory: GitWorktreeManager.realPath(request.commonGitDirectory),
             home: home
         )
+        // The session is kept on disk under an ID DevPilot chooses, so a run that was stopped can
+        // be continued with its context instead of starting over.
+        let session = request.sessionID.map { request.continuesSession ? ["--resume", $0] : ["--session-id", $0] } ?? []
         // Each rule is its own argument: rules such as `Bash(git status:*)` contain spaces.
-        return common(schema: ImplementationPrompt.schema, policy: ImplementationPrompt.policy)
+        return common(schema: ImplementationPrompt.schema, policy: ImplementationPrompt.policy, persistsSession: request.sessionID != nil)
+            + session
             + ["--tools", tools]
             + ["--allowedTools"] + allowed
             + ["--disallowedTools"] + denied
@@ -155,9 +170,27 @@ public struct ClaudeCodeRunner: AgentRunner {
         return arguments
     }
 
+    public func updateQAMemory(_ request: QAMemoryRequest) async throws -> (QAMemoryUpdate, AgentRunStats) {
+        try await run(
+            arguments: common(schema: QAMemoryPrompt.schema, policy: QAMemoryPrompt.policy, model: QAMemoryPrompt.model)
+                + ["--tools", ""],
+            prompt: QAMemoryPrompt.render(request),
+            worktree: request.workingDirectory,
+            environment: Self.environment(),
+            timeout: .seconds(5 * 60),
+            logURL: request.logURL,
+            onLaunch: nil,
+            onProgress: { _ in }
+        )
+    }
+
     // MARK: - Shared
 
-    private func common(schema: String, policy: String, mcpConfig: String = #"{"mcpServers":{}}"#) -> [String] {
+    /// `model` overrides the configured model for small jobs.
+    private func common(
+        schema: String, policy: String, mcpConfig: String = #"{"mcpServers":{}}"#, model override: String? = nil,
+        persistsSession: Bool = false
+    ) -> [String] {
         var arguments = [
             "-p",
             "--output-format", "stream-json", "--verbose",
@@ -165,11 +198,13 @@ public struct ClaudeCodeRunner: AgentRunner {
             "--permission-mode", "dontAsk",
             "--setting-sources", "",
             "--strict-mcp-config", "--mcp-config", mcpConfig,
-            "--no-session-persistence",
             "--append-system-prompt", policy,
         ]
-        if let model {
+        if let model = override ?? model {
             arguments += ["--model", model]
+        }
+        if !persistsSession {
+            arguments.append("--no-session-persistence")
         }
         return arguments
     }
@@ -185,6 +220,7 @@ public struct ClaudeCodeRunner: AgentRunner {
         worktree: String,
         environment: [String: String],
         timeout: Duration,
+        idleTimeout: Duration? = nil,
         logURL: URL,
         onLaunch: (@Sendable (pid_t) -> Void)?,
         onProgress: @escaping @Sendable (String) -> Void
@@ -199,11 +235,15 @@ public struct ClaudeCodeRunner: AgentRunner {
                 environment: environment,
                 stdin: Data(prompt.utf8),
                 timeout: timeout,
-                onLaunch: onLaunch
+                onLaunch: onLaunch,
+                idleTimeout: idleTimeout
             )
         ) { line in
             log.append(line)
             guard let event = try? JSONDecoder().decode(JSONValue.self, from: Data(line.utf8)) else { return }
+            if let usage = ClaudeUsage(event: event) {
+                onUsage?(usage)
+            }
             if event["type"]?.string == "result" {
                 finalEvent.withLock { $0 = event }
             }
@@ -213,6 +253,9 @@ public struct ClaudeCodeRunner: AgentRunner {
         }
         log.close(stderr: result.stderrText)
 
+        if result.stalled, let idleTimeout {
+            throw AgentError.stalled(minutes: Int(idleTimeout.components.seconds / 60))
+        }
         if result.timedOut {
             throw AgentError.timedOut(minutes: Int(timeout.components.seconds / 60))
         }

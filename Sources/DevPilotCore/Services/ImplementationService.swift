@@ -28,12 +28,18 @@ public final class ImplementationService: Sendable {
     private let worktrees: GitWorktreeManager
     private let runner: any AgentRunner
     private let artifacts: ArtifactStore
+    /// Setup commands are heavy (installs, builds); nil runs them without waiting.
+    private let buildGate: BuildGate?
 
-    public init(database: AppDatabase, worktrees: GitWorktreeManager, runner: any AgentRunner, artifacts: ArtifactStore) {
+    public init(
+        database: AppDatabase, worktrees: GitWorktreeManager, runner: any AgentRunner, artifacts: ArtifactStore,
+        buildGate: BuildGate? = nil
+    ) {
         self.database = database
         self.worktrees = worktrees
         self.runner = runner
         self.artifacts = artifacts
+        self.buildGate = buildGate
     }
 
     /// Starts from `approved`. Runs the repository's enabled setup commands, then the agent,
@@ -41,11 +47,15 @@ public final class ImplementationService: Sendable {
     ///
     /// With `fixInstructions`, fixes the existing implementation instead (from `validating`,
     /// `reviewing` or `ready_for_human_review`); setup is skipped because it already ran.
+    ///
+    /// With `continuing`, resumes that agent session of a run that was stopped (from `approved`,
+    /// after `returnToApprovedPlan`): the agent keeps its context and the worktree its changes.
     public func implement(
         ticketID: String,
         repository: RepositoryConfig,
         tools: ToolEnvironment,
         fixInstructions: String? = nil,
+        continuing sessionToResume: String? = nil,
         onEvent: @escaping @Sendable (RunEvent) -> Void
     ) async throws -> ImplementationResult {
         guard let ticket = try await database.ticket(id: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
@@ -64,15 +74,20 @@ public final class ImplementationService: Sendable {
         } else {
             try await database.beginImplementation(ticketID: ticketID, logPath: logURL.path)
         }
+        let sessionID = sessionToResume ?? UUID().uuidString.lowercased()
+        try await database.recordSession(runID: runID, sessionID: sessionID)
         onEvent(.started)
 
         do {
             let headBefore = try await worktrees.head(of: workspace.worktreePath)
+            // Before setup, which may touch lockfiles: what an unfinished earlier attempt left.
+            let earlierChanges = fixInstructions == nil && sessionToResume == nil
+                ? ((try? await worktrees.changedFiles(in: workspace.worktreePath, since: workspace.baseCommit)) ?? []).map(\.path) : []
             let setupLog = logURL.deletingPathExtension().appendingPathExtension("setup.log")
-            for rule in repository.setupCommands where rule.isEnabled && fixInstructions == nil {
+            for rule in repository.setupCommands where rule.isEnabled && fixInstructions == nil && sessionToResume == nil {
                 onEvent(.progress("Setup: \(rule.command)"))
                 do {
-                    try await runSetup(rule.command, in: workspace.worktreePath, tools: tools, log: setupLog)
+                    try await runSetup(rule.command, in: workspace.worktreePath, tools: tools, log: setupLog) { onEvent(.progress($0)) }
                 } catch ImplementationError.setupFailed(let command, let detail) where rule.isOptional {
                     onEvent(.progress("Optional setup failed, continuing: `\(command)` (\(detail.prefix(160)))"))
                 }
@@ -87,6 +102,9 @@ public final class ImplementationService: Sendable {
                 tools: tools,
                 logURL: logURL,
                 fixInstructions: fixInstructions,
+                sessionID: sessionID,
+                continuesSession: sessionToResume != nil,
+                earlierChanges: earlierChanges,
                 onLaunch: { [database] group in
                     Task { try? await database.recordProcessGroup(runID: runID, processGroup: group) }
                 }
@@ -100,7 +118,7 @@ public final class ImplementationService: Sendable {
             }
             let result = ImplementationResult(
                 report: report,
-                changedFiles: try await worktrees.changedFiles(in: workspace.worktreePath),
+                changedFiles: try await worktrees.changedFiles(in: workspace.worktreePath, since: workspace.baseCommit),
                 planVersion: plan.version
             )
             // Nothing to validate: fail with the agent's explanation, keeping its report.
@@ -135,14 +153,21 @@ public final class ImplementationService: Sendable {
 
     /// Setup commands are written by the user in Settings, so they run through the shell, with
     /// network access, outside the agent sandbox, in the worktree.
-    private func runSetup(_ command: String, in worktree: String, tools: ToolEnvironment, log: URL) async throws {
-        let result = try await ProcessRunner.run(ProcessRequest(
+    private func runSetup(
+        _ command: String, in worktree: String, tools: ToolEnvironment, log: URL, onWait: @escaping @Sendable (String) -> Void
+    ) async throws {
+        let request = ProcessRequest(
             executable: URL(filePath: "/bin/sh"),
             arguments: ["-c", command],
             workingDirectory: URL(filePath: worktree, directoryHint: .isDirectory),
             environment: tools.variables(base: ClaudeCodeRunner.environment()),
             timeout: Self.setupTimeout
-        ))
+        )
+        let result = if let buildGate {
+            try await buildGate.run(onWait: onWait) { try await ProcessRunner.run(request) }
+        } else {
+            try await ProcessRunner.run(request)
+        }
         try? FileManager.default.createDirectory(at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
         let entry = "$ \(command)\n\(result.stdoutText)\(result.stderrText)\n[\(result.timedOut ? "timed out" : "\(result.termination)")]\n\n"
         if let handle = try? FileHandle(forWritingTo: log) {

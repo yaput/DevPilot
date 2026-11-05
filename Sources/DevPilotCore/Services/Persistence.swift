@@ -6,6 +6,20 @@ import GRDB
 ///
 /// Every state change goes through `applyTransition` inside a single write transaction,
 /// together with its audit event, so a crash can never leave state and history out of sync.
+public enum TicketDeletionError: Error, Equatable, LocalizedError {
+    case notLocal
+    case local
+    case running
+
+    public var errorDescription: String? {
+        switch self {
+        case .notLocal: "Only tickets written in DevPilot can be deleted; synced tickets come back with the next sync. Stop following them instead."
+        case .local: "Tickets written in DevPilot are deleted rather than unfollowed."
+        case .running: "A run is in progress for this ticket. Stop it first."
+        }
+    }
+}
+
 public final class AppDatabase: Sendable {
     let writer: any DatabaseWriter
 
@@ -23,8 +37,21 @@ public final class AppDatabase: Sendable {
         try AppDatabase(DatabaseQueue())
     }
 
+    /// `DEVPILOT_DATA_DIR` moves all of DevPilot's data elsewhere (see `isIsolated`).
     public static var defaultDirectory: URL {
-        URL.applicationSupportDirectory.appending(path: "DevPilot", directoryHint: .isDirectory)
+        if let custom = isolatedDirectory {
+            return URL(filePath: custom, directoryHint: .isDirectory)
+        }
+        return URL.applicationSupportDirectory.appending(path: "DevPilot", directoryHint: .isDirectory)
+    }
+
+    /// A development copy started with `DEVPILOT_DATA_DIR` (scripts/run-isolated.sh): its own data,
+    /// settings and Keychain entries, and it never touches processes it did not start, so it can
+    /// run next to the installed app.
+    public static var isIsolated: Bool { isolatedDirectory != nil }
+
+    private static var isolatedDirectory: String? {
+        ProcessInfo.processInfo.environment["DEVPILOT_DATA_DIR"].flatMap { $0.isEmpty ? nil : $0 }
     }
 
     // MARK: - Schema
@@ -145,6 +172,22 @@ public final class AppDatabase: Sendable {
                 ALTER TABLE decisionDocumentNew RENAME TO decisionDocument;
                 """)
         }
+        migrator.registerMigration("v5-agent-sessions") { db in
+            // The Claude session of an implementation run, so a stopped run can be continued.
+            try db.execute(sql: "ALTER TABLE agentRun ADD COLUMN sessionID TEXT")
+        }
+        migrator.registerMigration("v6-local-ticket-numbers") { db in
+            // The highest DP number ever used, so a deleted ticket's number (and its leftover
+            // worktree folder and branch name) is never handed out again.
+            try db.execute(sql: "CREATE TABLE localTicketNumber (id INTEGER PRIMARY KEY CHECK (id = 1), lastNumber INTEGER NOT NULL)")
+            let used = try String.fetchAll(db, sql: "SELECT externalID FROM ticket WHERE provider = ?", arguments: [TicketProviderKind.local.rawValue])
+            let last = used.compactMap { Int($0.split(separator: "-").last ?? "") }.max() ?? 0
+            try db.execute(sql: "INSERT INTO localTicketNumber (id, lastNumber) VALUES (1, ?)", arguments: [last])
+        }
+        migrator.registerMigration("v7-unfollowed-tickets") { db in
+            // Synced tickets the user stopped following: kept through syncs, hidden everywhere.
+            try db.execute(sql: "ALTER TABLE ticket ADD COLUMN isUnfollowed INTEGER NOT NULL DEFAULT 0")
+        }
         return migrator
     }
 
@@ -208,13 +251,35 @@ public final class AppDatabase: Sendable {
         }
     }
 
+    /// Tickets still in `discovered` with nothing done to them (their only event is the
+    /// discovery), and when they were discovered. Autopilot picks its tickets from these.
+    public func untouchedTickets() async throws -> [String: Date] {
+        try await writer.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT ticketWorkflow.ticketID AS ticketID, MIN(workflowEvent.createdAt) AS discoveredAt
+                FROM ticketWorkflow JOIN workflowEvent ON workflowEvent.ticketID = ticketWorkflow.ticketID
+                JOIN ticket ON ticket.id = ticketWorkflow.ticketID
+                WHERE ticketWorkflow.state = ? AND ticket.isUnfollowed = 0
+                GROUP BY ticketWorkflow.ticketID
+                HAVING COUNT(workflowEvent.id) = 1
+                """, arguments: [WorkflowState.discovered.rawValue])
+            var result: [String: Date] = [:]
+            for row in rows {
+                result[row["ticketID"]] = Date(timeIntervalSince1970: row["discoveredAt"])
+            }
+            return result
+        }
+    }
+
     /// A ticket written in DevPilot for `repositoryID`, numbered DP-1, DP-2, … per database.
     public func addLocalTicket(
         title: String, description: String, acceptanceCriteria: [String], type: TicketType, repositoryID: String
     ) async throws -> Ticket {
         try await writer.write { db in
             let used = try String.fetchAll(db, sql: "SELECT externalID FROM ticket WHERE provider = ?", arguments: [TicketProviderKind.local.rawValue])
-            let next = (used.compactMap { Int($0.split(separator: "-").last ?? "") }.max() ?? 0) + 1
+            let lastEver = try Int.fetchOne(db, sql: "SELECT lastNumber FROM localTicketNumber WHERE id = 1") ?? 0
+            let next = max(used.compactMap { Int($0.split(separator: "-").last ?? "") }.max() ?? 0, lastEver) + 1
+            try db.execute(sql: "INSERT OR REPLACE INTO localTicketNumber (id, lastNumber) VALUES (1, ?)", arguments: [next])
             let externalID = "DP-\(next)"
             let ticket = Ticket(
                 provider: .local, source: repositoryID, externalID: externalID, title: title, description: description,
@@ -226,15 +291,62 @@ public final class AppDatabase: Sendable {
         }
     }
 
+    /// Deletes a ticket written in DevPilot with everything recorded about it (plans, approvals,
+    /// runs, history, worktree record). Synced tickets cannot be deleted: the next sync would
+    /// bring them back. Refused while a run is in progress. The worktree itself is the caller's.
+    public func deleteLocalTicket(id ticketID: String) async throws {
+        try await writer.write { db in
+            guard let provider = try String.fetchOne(db, sql: "SELECT provider FROM ticket WHERE id = ?", arguments: [ticketID]) else {
+                throw WorkflowError.unknownTicket(ticketID)
+            }
+            guard provider == TicketProviderKind.local.rawValue else { throw TicketDeletionError.notLocal }
+            let state = try Self.fetchState(db, ticketID: ticketID)
+            let open = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM agentRun WHERE ticketID = ? AND finishedAt IS NULL", arguments: [ticketID]) ?? 0
+            guard open == 0, state?.isAgentRunning != true else { throw TicketDeletionError.running }
+            for table in ["approval", "decisionDocument", "agentRun", "workflowEvent", "ticketWorkspace", "ticketWorkflow", "ticket"] {
+                let column = table == "ticket" ? "id" : "ticketID"
+                try db.execute(sql: "DELETE FROM \(table) WHERE \(column) = ?", arguments: [ticketID])
+            }
+        }
+    }
+
     /// Tickets to show on the dashboard: currently assigned ones, plus unassigned ones that are
     /// still mid-workflow so in-progress work never silently disappears.
     public func tickets() async throws -> [Ticket] {
         try await writer.read { db in
             try Row.fetchAll(db, sql: """
                 SELECT ticket.* FROM ticket JOIN ticketWorkflow ON ticketWorkflow.ticketID = ticket.id
-                WHERE ticket.isAssigned = 1 OR ticketWorkflow.state NOT IN (\(Self.inactiveStatesSQL))
+                WHERE ticket.isUnfollowed = 0
+                  AND (ticket.isAssigned = 1 OR ticketWorkflow.state NOT IN (\(Self.inactiveStatesSQL)))
                 ORDER BY ticket.provider, ticket.source, ticket.externalID
                 """).map(Self.ticket(from:))
+        }
+    }
+
+    /// Synced tickets the user stopped following, still assigned or not.
+    public func unfollowedTickets() async throws -> [Ticket] {
+        try await writer.read { db in
+            try Row.fetchAll(db, sql: "SELECT * FROM ticket WHERE isUnfollowed = 1 ORDER BY provider, source, externalID")
+                .map(Self.ticket(from:))
+        }
+    }
+
+    /// Stops (or resumes) following a synced ticket. Syncs keep the choice; nothing else about
+    /// the ticket changes, so following it again brings it back as it was. Refused while a run
+    /// is in progress. Tickets written in DevPilot are deleted instead.
+    public func setFollowing(_ following: Bool, ticketID: String) async throws {
+        try await writer.write { db in
+            guard let provider = try String.fetchOne(db, sql: "SELECT provider FROM ticket WHERE id = ?", arguments: [ticketID]) else {
+                throw WorkflowError.unknownTicket(ticketID)
+            }
+            guard provider != TicketProviderKind.local.rawValue else { throw TicketDeletionError.local }
+            let open = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM agentRun WHERE ticketID = ? AND finishedAt IS NULL", arguments: [ticketID]) ?? 0
+            guard open == 0, try Self.fetchState(db, ticketID: ticketID)?.isAgentRunning != true else { throw TicketDeletionError.running }
+            try db.execute(sql: "UPDATE ticket SET isUnfollowed = ? WHERE id = ?", arguments: [following ? 0 : 1, ticketID])
+            try Self.insertEvent(
+                db, ticketID: ticketID, kind: .transition, from: nil, to: nil,
+                message: following ? "Followed again" : "Stopped following", at: Date()
+            )
         }
     }
 
@@ -497,9 +609,11 @@ public final class AppDatabase: Sendable {
                     finishedAt: (row["finishedAt"] as Double?).map(Date.init(timeIntervalSince1970:)),
                     outcome: (row["outcome"] as String?).flatMap(AgentRun.Outcome.init(rawValue:)),
                     numTurns: row["numTurns"], costUSD: row["costUSD"], logPath: row["logPath"], errorMessage: row["errorMessage"],
+                    sessionID: row["sessionID"],
                     implementation: Self.decodeReport(row, kind: .implementation),
                     validation: Self.decodeReport(row, kind: .validation),
-                    review: Self.decodeReport(row, kind: .review)
+                    review: Self.decodeReport(row, kind: .review),
+                    qa: Self.decodeReport(row, kind: .qa)
                 )
             }
         }
@@ -622,6 +736,24 @@ public final class AppDatabase: Sendable {
             if thenReview {
                 try Self.applyTransition(db, ticketID: ticketID, to: .reviewing, kind: .transition, message: "Independent review started")
             }
+        }
+    }
+
+    public func recordSession(runID: Int64, sessionID: String) async throws {
+        try await writer.write { db in
+            try db.execute(sql: "UPDATE agentRun SET sessionID = ? WHERE id = ?", arguments: [sessionID, runID])
+        }
+    }
+
+    /// Records a pipeline QA session. The ticket stays in `validating`.
+    public func completeQA(runID: Int64, ticketID: String, result: QASessionResult) async throws {
+        try await writer.write { db in
+            try Self.closeRun(db, runID: runID, outcome: .succeeded, stats: nil, message: nil)
+            try db.execute(sql: "UPDATE agentRun SET reportJSON = ? WHERE id = ?", arguments: [try Self.json(result), runID])
+            let bugs = result.report.findings.count
+            let summary = bugs == 0 ? "QA session found no bugs"
+                : "QA session reported \(bugs) bug\(bugs == 1 ? "" : "s"), \(result.confirmedCount) reproduced by replay"
+            try Self.insertEvent(db, ticketID: ticketID, kind: .transition, from: nil, to: nil, message: summary, at: Date())
         }
     }
 

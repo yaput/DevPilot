@@ -2,6 +2,7 @@ import AppKit
 import DevPilotCore
 import Foundation
 import Observation
+import Synchronization
 
 /// Everything the ticket detail screen shows besides the ticket itself.
 struct TicketDetailData: Equatable {
@@ -21,6 +22,17 @@ struct TicketDetailData: Equatable {
     var latestReview: AgentRun? {
         runs.last { $0.review != nil }
     }
+
+    /// The last pipeline QA run, finished or not.
+    var latestQA: AgentRun? {
+        runs.last { $0.kind == .qa }
+    }
+}
+
+struct AppMessage: Identifiable, Equatable {
+    let id = UUID()
+    let text: String
+    let date = Date()
 }
 
 /// Live progress of an agent run in this app session.
@@ -54,6 +66,9 @@ final class AppModel {
     private var services: Services
     private var recoveredDatabasePath: String?
     @ObservationIgnored private var runTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var backgroundSyncTask: Task<Void, Never>?
+    /// When the last sync finished, whatever started it.
+    private(set) var lastSyncAt: Date?
     /// Repository secrets and provider tokens. Only DevPilot's own code reads repository
     /// secrets; they are never given to an agent.
     @ObservationIgnored private let credentials: any CredentialStore
@@ -71,9 +86,19 @@ final class AppModel {
     /// The QA session running or last finished in this launch.
     private(set) var qaSession: QASessionState?
     @ObservationIgnored private var qaSessionTask: Task<Void, Never>?
-    /// Investigations mostly wait on Claude; builds (implementation, tests, review) load the Mac.
-    @ObservationIgnored private let investigationSlots: RunLimiter
-    @ObservationIgnored private let buildSlots: RunLimiter
+    /// The ticket whose pipeline QA holds the local environment.
+    private(set) var pipelineQATicketID: String?
+    @ObservationIgnored private let pipelineQA = PipelineQABridge()
+    /// The claude.ai plan's usage: from every Claude run, or fetched on request.
+    private(set) var claudeUsage: ClaudeUsage?
+    private(set) var isFetchingUsage = false
+    private(set) var usageError: String?
+    @ObservationIgnored private let usageStore = ClaudeUsageStore(directory: AppDatabase.defaultDirectory)
+    @ObservationIgnored private let usageRelay = UsageRelay()
+    /// Tickets with a run in progress: every agent phase, mostly waiting on Claude.
+    @ObservationIgnored private let agentSlots: RunLimiter
+    /// Setup and validation commands inside those runs: the part that loads the Mac.
+    @ObservationIgnored private let buildGate: BuildGate
 
     let artifacts = ArtifactStore(root: AppDatabase.defaultDirectory.appending(path: "artifacts", directoryHint: .isDirectory))
     /// Editors installed on this Mac, detected once per launch.
@@ -86,8 +111,12 @@ final class AppModel {
     private(set) var tickets: [Ticket] = []
     private(set) var states: [String: WorkflowState] = [:]
     private(set) var unassignedIDs: Set<String> = []
+    /// Synced tickets the user stopped following; shown only in their own sidebar group.
+    private(set) var unfollowedTickets: [Ticket] = []
     private(set) var syncResults: [TicketProviderKind: ProviderSyncResult] = [:]
     private(set) var activity: [String: RunActivity] = [:]
+    /// Setup and validation commands running now (see `BuildGate`).
+    private(set) var buildsRunning = 0
     private(set) var isSyncing = false
     /// Bumped whenever ticket details change outside a state transition.
     private(set) var detailRevision = 0
@@ -100,7 +129,27 @@ final class AppModel {
         get { selection.count == 1 ? selection.first : nil }
         set { selection = newValue.map { [$0] } ?? [] }
     }
-    var lastError: String?
+    /// App-wide messages, oldest first, shown as a stack of dismissible banners.
+    private(set) var messages: [AppMessage] = []
+
+    /// Setting adds a message (a repeat of the newest is dropped); setting nil clears them all.
+    var lastError: String? {
+        get { messages.last?.text }
+        set {
+            guard let newValue else {
+                messages.removeAll()
+                return
+            }
+            guard messages.last?.text != newValue else { return }
+            messages.append(AppMessage(text: newValue))
+            if messages.count > Self.maxMessages { messages.removeFirst(messages.count - Self.maxMessages) }
+        }
+    }
+    private static let maxMessages = 5
+
+    func dismissMessage(_ id: AppMessage.ID) {
+        messages.removeAll { $0.id == id }
+    }
 
     private var started = false
 
@@ -121,14 +170,15 @@ final class AppModel {
         self.settings = settings
         self.workspaceSettings = workspaceSettings
         self.agentSettings = agentSettings
-        investigationSlots = RunLimiter(limit: agentSettings.maxParallelInvestigations)
-        buildSlots = RunLimiter(limit: agentSettings.maxParallelBuilds)
+        agentSlots = RunLimiter(limit: agentSettings.maxParallelAgents)
+        buildGate = BuildGate(limit: agentSettings.maxParallelBuilds)
         let (orchestrator, databaseLocation, message) = Self.makeOrchestrator(settings: settings, factory: factory)
         self.orchestrator = orchestrator
         self.databaseLocation = databaseLocation
-        self.lastError = message
+        self.messages = message.map { [AppMessage(text: $0)] } ?? []
         services = Self.makeServices(
-            database: orchestrator.database, workspace: workspaceSettings, agent: agentSettings, artifacts: artifacts
+            database: orchestrator.database, workspace: workspaceSettings, agent: agentSettings, artifacts: artifacts,
+            buildGate: buildGate, pipelineQA: pipelineQA, usageRelay: usageRelay
         )
         // Child processes are in their own process groups, so they would outlive the app.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
@@ -136,6 +186,11 @@ final class AppModel {
         }
         Notifier.shared.onOpenTicket = { [weak self] ticketID in
             self?.selectedTicketID = ticketID
+        }
+        pipelineQA.model = self
+        claudeUsage = usageStore.read()
+        usageRelay.setHandler { [weak self] usage in
+            Task { @MainActor in self?.recordUsage(usage) }
         }
     }
 
@@ -151,7 +206,32 @@ final class AppModel {
     }
 
     var selectedTicket: Ticket? {
-        tickets.first { $0.id == selectedTicketID }
+        tickets.first { $0.id == selectedTicketID } ?? unfollowedTickets.first { $0.id == selectedTicketID }
+    }
+
+    func isFollowing(_ ticketID: String) -> Bool {
+        !unfollowedTickets.contains { $0.id == ticketID }
+    }
+
+    /// Synced tickets among `ticketIDs` that can be unfollowed now (followed, not running).
+    func unfollowableTickets(among ticketIDs: [String]) -> [Ticket] {
+        tickets.filter { ticketIDs.contains($0.id) && $0.provider != .local && !isRunning($0.id) && localRun?.ticketID != $0.id }
+    }
+
+    /// Stops or resumes following synced tickets. Nothing else about them changes.
+    func setFollowing(_ following: Bool, ticketIDs: [String]) async {
+        let targets = following ? unfollowedTickets.filter { ticketIDs.contains($0.id) } : unfollowableTickets(among: ticketIDs)
+        var problems: [String] = []
+        for ticket in targets {
+            do {
+                try await orchestrator.database.setFollowing(following, ticketID: ticket.id)
+            } catch {
+                problems.append("\(ticket.externalID): \(error.localizedDescription)")
+            }
+        }
+        await reload()
+        detailRevision += 1
+        if !problems.isEmpty { lastError = problems.joined(separator: "; ") }
     }
 
     var runningCount: Int { states.values.filter(\.isAgentRunning).count }
@@ -171,19 +251,28 @@ final class AppModel {
         guard !started else { return }
         started = true
         // Leftovers of a local run interrupted by a crash: services, database copy, copied files.
+        // An isolated copy leaves them alone: they may belong to the installed app.
         let credentials = self.credentials
-        await localEnvironment.cleanUpLeftovers(tools: agentSettings.toolEnvironment) { repositoryID, name in
-            (try? credentials.secret(for: .repository(repositoryID, name))) ?? nil
+        if !AppDatabase.isIsolated {
+            await localEnvironment.cleanUpLeftovers(tools: agentSettings.toolEnvironment) { repositoryID, name in
+                (try? credentials.secret(for: .repository(repositoryID, name))) ?? nil
+            }
         }
         Notifier.shared.requestAuthorization()
+        await buildGate.observe { [weak self] count in
+            Task { @MainActor in self?.buildsRunning = count }
+        }
         await recoverIfNeeded()
         await reload()
         await refresh()
+        startBackgroundSync()
     }
 
     /// Re-reads saved provider settings, rebuilds providers (switching database when sample data
     /// is toggled) and syncs.
     func reconfigure() async {
+        // The sync interval applies right away; providers and the database wait for runs to end.
+        settings.syncIntervalMinutes = settingsStore.load(ProviderSettings.self).syncIntervalMinutes
         guard !hasActiveRuns else {
             lastError = "Settings were saved, but they take effect after the running agent finishes."
             return
@@ -203,10 +292,128 @@ final class AppModel {
         guard !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
+        let started = Date()
         for result in await orchestrator.sync() {
             syncResults[result.kind] = result
         }
+        lastSyncAt = Date()
         await reload()
+        let arrived = await ticketsDiscovered(since: started)
+        let picked = await runAutopilot()
+        notifyArrivals(arrived, pickedByAutopilot: picked)
+    }
+
+    // MARK: - Background sync
+
+    /// Autopilot needs new tickets to arrive, so it syncs every 5 minutes even when background
+    /// sync is off.
+    private static let autopilotSyncMinutes = 5
+
+    /// Minutes between background syncs, or nil when there are none.
+    var syncIntervalMinutes: Int? {
+        let configured = settings.syncIntervalMinutes
+        if configured > 0 { return configured }
+        return autopilotInvestigates ? Self.autopilotSyncMinutes : nil
+    }
+
+    /// Whether any tracker (Shortcut, Jira, sample data) is synced at all.
+    var syncsProviders: Bool { !orchestrator.providerKinds.isEmpty }
+
+    /// When the next background sync is due.
+    var nextSyncAt: Date? {
+        guard let minutes = syncIntervalMinutes, !orchestrator.providerKinds.isEmpty else { return nil }
+        return (lastSyncAt ?? Date()).addingTimeInterval(TimeInterval(minutes * 60))
+    }
+
+    /// Checks twice a minute whether a sync is due, so interval changes apply without a restart.
+    private func startBackgroundSync() {
+        backgroundSyncTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                guard let self else { return }
+                if let next = self.nextSyncAt, next <= Date(), !self.isSyncing {
+                    await self.refresh()
+                }
+            }
+        }
+    }
+
+    /// Synced tickets that arrived during this sync (local tickets are the user's own).
+    private func ticketsDiscovered(since start: Date) async -> [Ticket] {
+        guard let untouched = try? await orchestrator.database.untouchedTickets() else { return [] }
+        return tickets.filter { ticket in
+            ticket.provider != .local && (untouched[ticket.id].map { $0 >= start } ?? false)
+        }
+    }
+
+    /// One notification per new ticket, or one summary when many arrive at once (e.g. a first sync).
+    private func notifyArrivals(_ arrived: [Ticket], pickedByAutopilot picked: Set<String>) {
+        // Picked up now but synced earlier (e.g. its repository's routing changed).
+        for ticket in tickets where picked.contains(ticket.id) && ticket.provider != .local && !arrived.contains(where: { $0.id == ticket.id }) {
+            Notifier.shared.post(title: "Autopilot started investigating", body: "\(ticket.externalID): \(ticket.title)", ticketID: ticket.id)
+        }
+        guard !arrived.isEmpty else { return }
+        if arrived.count > 3 {
+            let investigating = arrived.filter { picked.contains($0.id) }.count
+            Notifier.shared.post(
+                title: "\(arrived.count) new tickets assigned to you",
+                body: investigating > 0 ? "Autopilot is investigating \(investigating) of them." : arrived.map(\.externalID).joined(separator: ", "),
+                ticketID: arrived[0].id
+            )
+            return
+        }
+        for ticket in arrived {
+            Notifier.shared.post(
+                title: picked.contains(ticket.id) ? "New ticket: autopilot is investigating" : "New ticket assigned to you",
+                body: "\(ticket.externalID): \(ticket.title)", ticketID: ticket.id
+            )
+        }
+    }
+
+    // MARK: - Autopilot
+
+    var autopilotInvestigates: Bool {
+        workspaceSettings.repositories.contains { $0.autopilot.investigatesNewTickets }
+    }
+
+    var autopilotImplements: Bool {
+        workspaceSettings.repositories.contains { $0.autopilot.implementWhenApproved }
+    }
+
+    /// Investigates tickets that arrived after autopilot was turned on for their repository and
+    /// that nobody has touched. Runs queue behind the agent limit like any other. Returns the
+    /// tickets it started.
+    @discardableResult
+    private func runAutopilot() async -> Set<String> {
+        guard autopilotInvestigates else { return [] }
+        let untouched: [String: Date]
+        do {
+            untouched = try await orchestrator.database.untouchedTickets()
+        } catch {
+            lastError = "Autopilot could not read tickets: \(error.localizedDescription)"
+            return []
+        }
+        var started: Set<String> = []
+        for ticket in tickets {
+            guard let discoveredAt = untouched[ticket.id], !isRunning(ticket.id),
+                  let repository = workspaceSettings.suggestedRepository(for: ticket),
+                  repository.autopilot.shouldInvestigate(discoveredAt: discoveredAt) else { continue }
+            do {
+                try await orchestrator.database.transition(ticketID: ticket.id, to: .selected, message: "Selected by autopilot")
+            } catch {
+                lastError = "\(ticket.externalID): autopilot could not start: \(error.localizedDescription)"
+                continue
+            }
+            startInvestigation(ticket.id, repositoryID: repository.id)
+            started.insert(ticket.id)
+        }
+        return started
+    }
+
+    /// Whether approving this ticket's plan starts its implementation (autopilot).
+    func implementsOnApproval(_ ticketID: String) async -> Bool {
+        guard let ticket = tickets.first(where: { $0.id == ticketID }), let id = await repositoryID(of: ticket) else { return false }
+        return workspaceSettings.repository(id: id)?.autopilot.implementWhenApproved == true
     }
 
     // MARK: - Workflow actions
@@ -231,7 +438,7 @@ final class AppModel {
             return
         }
         let service = services.investigation
-        launch(.investigation, ticketID: ticketID, slots: investigationSlots) { onEvent in
+        launch(.investigation, ticketID: ticketID, slots: agentSlots) { onEvent in
             let override = baseBranch?.trimmingCharacters(in: .whitespaces)
             _ = try await service.investigate(
                 ticketID: ticketID, repository: repository,
@@ -249,7 +456,7 @@ final class AppModel {
         let service = services.implementation
         let verification = services.verification
         let fixAttempts = agentSettings.automaticFixAttempts
-        launch(.implementation, ticketID: ticketID, slots: buildSlots) { [self] onEvent in
+        launch(.implementation, ticketID: ticketID, slots: agentSlots) { [self] onEvent in
             if agentSettings.toolPath.isEmpty {
                 onEvent(.progress("Importing PATH and JAVA_HOME from your login shell"))
             }
@@ -270,7 +477,7 @@ final class AppModel {
         let verification = services.verification
         let tools = agentSettings.toolEnvironment
         let fixAttempts = agentSettings.automaticFixAttempts
-        launch(.validation, ticketID: ticketID, slots: buildSlots) { onEvent in
+        launch(.validation, ticketID: ticketID, slots: agentSlots) { onEvent in
             try await verification.verify(
                 ticketID: ticketID, repository: repository, tools: tools, maxFixAttempts: fixAttempts, onEvent: onEvent
             )
@@ -288,7 +495,7 @@ final class AppModel {
         let verification = services.verification
         let tools = agentSettings.toolEnvironment
         let fixAttempts = agentSettings.automaticFixAttempts
-        launch(.implementation, ticketID: ticketID, slots: buildSlots) { onEvent in
+        launch(.implementation, ticketID: ticketID, slots: agentSlots) { onEvent in
             _ = try await implementation.implement(
                 ticketID: ticketID, repository: repository, tools: tools, fixInstructions: instructions, onEvent: onEvent
             )
@@ -320,6 +527,51 @@ final class AppModel {
         return await GitWorktreeManager(worktreeRoot: workspaceSettings.resolvedWorktreeRoot).branchStatus(workspace)
     }
 
+    /// Why the worktree cannot be committed right now, or nil if it can: never while an agent or
+    /// a local run (which copies `.env` files in) is using it.
+    func commitBlocker(_ ticketID: String) -> String? {
+        if isRunning(ticketID) { return "Wait for the run to finish." }
+        if let localRun, localRun.ticketID == ticketID {
+            switch localRun.phase {
+            case .stopped, .failed: break
+            default: return "Stop the local run first: it copies files such as .env into the worktree."
+            }
+        }
+        if qaSession?.ticketID == ticketID { return "Wait for the QA session to finish." }
+        return nil
+    }
+
+    /// `SC-1234: Title`, which also links the commit to the ticket in Shortcut and Jira.
+    func defaultCommitMessage(_ ticketID: String) -> String {
+        guard let ticket = selectedTicket?.id == ticketID ? selectedTicket : tickets.first(where: { $0.id == ticketID }) else { return "" }
+        return "\(ticket.externalID): \(ticket.title)"
+    }
+
+    /// Commits everything in the ticket's worktree on its branch. Returns the short hash, or nil
+    /// with the reason in `lastError`. Never pushes.
+    func commitChanges(_ ticketID: String, message: String? = nil, skippingHooks: Bool = false) async -> String? {
+        if let blocker = commitBlocker(ticketID) {
+            lastError = "Could not commit: \(blocker)"
+            return nil
+        }
+        do {
+            guard let workspace = try await Task(operation: { try await self.orchestrator.database.workspace(ticketID: ticketID) }).value else {
+                lastError = "Could not commit: this ticket has no worktree."
+                return nil
+            }
+            let excluded = workspaceSettings.repository(id: workspace.repositoryID)?.localRun.copyFiles ?? []
+            let hash = try await GitWorktreeManager(worktreeRoot: workspaceSettings.resolvedWorktreeRoot).commitAll(
+                workspace, message: message ?? defaultCommitMessage(ticketID), excluding: excluded,
+                tools: try await ensureToolEnvironment(), skippingHooks: skippingHooks
+            )
+            detailRevision += 1
+            return hash
+        } catch {
+            lastError = "Could not commit: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
     /// After a failed or stopped implementation: back to the approved plan, then implement again.
     func retryImplementation(_ ticketID: String, repositoryID: String) async {
         do {
@@ -331,6 +583,35 @@ final class AppModel {
         }
         await reload()
         startImplementation(ticketID, repositoryID: repositoryID)
+    }
+
+    /// After a stopped, failed or timed-out implementation: back to the approved plan, then the
+    /// same agent session continues with its context, instead of a new one starting over.
+    func continueImplementation(_ ticketID: String, repositoryID: String, sessionID: String) async {
+        guard let repository = workspaceSettings.repository(id: repositoryID) else {
+            lastError = "This ticket's repository is no longer in Settings → Repositories."
+            return
+        }
+        do {
+            try await orchestrator.database.returnToApprovedPlan(ticketID: ticketID)
+        } catch {
+            lastError = error.localizedDescription
+            await reload()
+            return
+        }
+        await reload()
+        let service = services.implementation
+        let verification = services.verification
+        let fixAttempts = agentSettings.automaticFixAttempts
+        launch(.implementation, ticketID: ticketID, slots: agentSlots) { [self] onEvent in
+            let tools = try await ensureToolEnvironment()
+            _ = try await service.implement(
+                ticketID: ticketID, repository: repository, tools: tools, continuing: sessionID, onEvent: onEvent
+            )
+            try await verification.verify(
+                ticketID: ticketID, repository: repository, tools: tools, maxFixAttempts: fixAttempts, onEvent: onEvent
+            )
+        }
     }
 
     func stopRun(_ ticketID: String) {
@@ -355,6 +636,10 @@ final class AppModel {
         }
         await reload()
         detailRevision += 1
+        if decision == .approved, state(of: ticketID) == .approved, await implementsOnApproval(ticketID),
+           let ticket = tickets.first(where: { $0.id == ticketID }), let id = await repositoryID(of: ticket) {
+            startImplementation(ticketID, repositoryID: id)
+        }
     }
 
     func loadDetail(_ ticketID: String) async -> TicketDetailData {
@@ -411,6 +696,37 @@ final class AppModel {
         detailRevision += 1
     }
 
+    /// Tickets written in DevPilot among `ticketIDs` that can be deleted now (not running).
+    func deletableTickets(among ticketIDs: [String]) -> [Ticket] {
+        tickets.filter { ticketIDs.contains($0.id) && $0.provider == .local && !isRunning($0.id) && localRun?.ticketID != $0.id }
+    }
+
+    /// Deletes tickets written in DevPilot with their plans, runs, history and artifacts. Their
+    /// worktrees are removed only when asked, and then with any uncommitted changes; a branch
+    /// with commits of its own is always kept.
+    func deleteLocalTickets(_ ticketIDs: [String], removingWorktrees: Bool) async {
+        let worktrees = GitWorktreeManager(worktreeRoot: workspaceSettings.resolvedWorktreeRoot)
+        var problems: [String] = []
+        for ticket in deletableTickets(among: ticketIDs) {
+            do {
+                if removingWorktrees, let workspace = try await orchestrator.database.workspace(ticketID: ticket.id) {
+                    if try await !worktrees.removeWorktree(workspace, discardingChanges: true) {
+                        problems.append("\(ticket.externalID): branch \(workspace.branch) has commits, so it was kept")
+                    }
+                }
+                try await orchestrator.database.deleteLocalTicket(id: ticket.id)
+                try? FileManager.default.removeItem(at: artifacts.directory(for: ticket.id))
+            } catch {
+                problems.append("\(ticket.externalID): \(error.localizedDescription)")
+            }
+        }
+        selection.subtract(ticketIDs)
+        await reload()
+        if !problems.isEmpty {
+            lastError = "Not everything was deleted. " + problems.joined(separator: "; ")
+        }
+    }
+
     /// The ticket's worktree and everything in it that differs from its base commit.
     func loadChanges(_ ticketID: String) async throws -> (TicketWorkspace, [FileDiff]) {
         guard let workspace = try await orchestrator.database.workspace(ticketID: ticketID) else {
@@ -437,13 +753,13 @@ final class AppModel {
         guard settings != agentSettings else { return }
         // Concurrency limits can change any time; everything else waits until runs finish.
         var applied = hasActiveRuns ? agentSettings : settings
-        applied.maxParallelInvestigations = settings.maxParallelInvestigations
+        applied.maxParallelAgents = settings.maxParallelAgents
         applied.maxParallelBuilds = settings.maxParallelBuilds
         persist(applied)
         agentSettings = applied
         Task {
-            await investigationSlots.setLimit(applied.maxParallelInvestigations)
-            await buildSlots.setLimit(applied.maxParallelBuilds)
+            await agentSlots.setLimit(applied.maxParallelAgents)
+            await buildGate.setLimit(applied.maxParallelBuilds)
         }
         if !hasActiveRuns { rebuildServices() }
     }
@@ -465,6 +781,10 @@ final class AppModel {
     /// Starts the ticket's app locally (one at a time): dependencies, a database copy, setup,
     /// then the repository's services from the ticket's worktree on DevPilot's own ports.
     func startLocalRun(ticketID: String, workspace: TicketWorkspace) {
+        if let busy = pipelineQATicketID {
+            lastError = "DevPilot is testing \(tickets.first { $0.id == busy }?.externalID ?? "a ticket") locally. Try again when its QA session ends."
+            return
+        }
         guard localRunTask == nil, localRun == nil || isFinished(localRun) else {
             lastError = "Another local run is active. Stop it first."
             return
@@ -580,7 +900,7 @@ final class AppModel {
     /// Explores the ticket's running app with the QA agent (signed in first when configured),
     /// then replays every reported bug. One session at a time.
     func startQASession(ticketID: String, repositoryID: String) {
-        guard qaSessionTask == nil else { return }
+        guard qaSessionTask == nil, pipelineQATicketID == nil else { return }
         guard let qa = services.qa else {
             lastError = "QA sessions need Claude Code. Set its location in Settings → Agent."
             return
@@ -620,7 +940,7 @@ final class AppModel {
             }
             do {
                 let result = try await qa.run(
-                    ticketID: ticketID, localRun: run, signIn: signInResult, qaTools: tools, tools: ensureToolEnvironment(),
+                    ticketID: ticketID, repositoryName: repository.name, localRun: run, signIn: signInResult, qaTools: tools, tools: ensureToolEnvironment(),
                     timeLimitMinutes: max(1, repository.qa.timeLimitMinutes)
                 ) { [weak self] message in
                     Task { @MainActor in self?.appendQAProgress(message) }
@@ -637,6 +957,146 @@ final class AppModel {
 
     func cancelQASession() {
         qaSessionTask?.cancel()
+    }
+
+    // MARK: - Claude usage
+
+    /// Readings older than this are refreshed when the usage view appears.
+    static let usageMaxAge: TimeInterval = 10 * 60
+
+    private func recordUsage(_ usage: ClaudeUsage) {
+        claudeUsage = claudeUsage.map { $0.updated(with: usage) } ?? usage
+        usageError = nil
+        if let claudeUsage { usageStore.write(claudeUsage) }
+    }
+
+    /// Asks Claude Code for a fresh reading (one tiny Haiku request).
+    func refreshUsage() async {
+        guard !isFetchingUsage else { return }
+        guard let executable = resolvedClaudeExecutable else {
+            usageError = "Claude Code was not found. Set its location in Settings → Agent."
+            return
+        }
+        isFetchingUsage = true
+        defer { isFetchingUsage = false }
+        do {
+            recordUsage(try await ClaudeCLI.fetchUsage(executable: executable))
+        } catch {
+            usageError = error.localizedDescription
+        }
+    }
+
+    /// Refreshes a stale reading, unless a running agent is already reporting fresh ones.
+    func refreshUsageIfStale() async {
+        let age = claudeUsage.map { Date().timeIntervalSince($0.updatedAt) } ?? .infinity
+        guard age > Self.usageMaxAge, agentsWorking == 0 else { return }
+        await refreshUsage()
+    }
+
+    // MARK: - Pipeline QA
+
+    /// Pipeline QA (see `PipelineQA`): waits for the local environment, which runs one app at a
+    /// time, then holds a build slot while it starts this ticket's app, signs in and runs the QA
+    /// session. The app is always stopped again, also when the run is stopped.
+    func runPipelineQA(
+        ticketID: String, repository: RepositoryConfig, onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> QASessionResult {
+        guard let qa = services.qa else { throw PipelineQAError.unavailable("QA sessions need Claude Code. Set its location in Settings → Agent.") }
+        guard qaTools.isInstalled else { throw LoginError.toolsNotInstalled }
+        guard repository.localRun.isConfigured else { throw LocalRunError.notConfigured }
+        guard let workspace = try await orchestrator.database.workspace(ticketID: ticketID) else {
+            throw ImplementationError.worktreeMissing("the ticket's worktree")
+        }
+        try await claimLocalEnvironment(for: ticketID, onProgress: onProgress)
+        do {
+            let result = try await buildGate.run(onWait: onProgress) {
+                try await self.qaInLocalRun(ticketID: ticketID, repository: repository, workspace: workspace, qa: qa, onProgress: onProgress)
+            }
+            await releaseLocalEnvironment()
+            return result
+        } catch {
+            await releaseLocalEnvironment()
+            throw error
+        }
+    }
+
+    /// Waits until no app runs locally, then claims the environment. Checking and claiming happen
+    /// without a suspension in between, so two pipelines cannot claim it together.
+    private func claimLocalEnvironment(for ticketID: String, onProgress: @Sendable (String) -> Void) async throws {
+        var told = false
+        while pipelineQATicketID != nil || localRunTask != nil || qaSessionTask != nil || (localRun != nil && !isFinished(localRun)) {
+            if !told {
+                onProgress("Waiting to run the app locally: another app is running locally")
+                told = true
+            }
+            try await Task.sleep(for: .seconds(5))
+        }
+        pipelineQATicketID = ticketID
+        localRun = nil
+        qaSignIn = nil
+    }
+
+    private func releaseLocalEnvironment() async {
+        // From a fresh task: after Stop the current one is cancelled, and tearing down waits.
+        let environment = localEnvironment
+        await Task { await environment.stop() }.value
+        localRun = nil
+        qaSignIn = nil
+        pipelineQATicketID = nil
+    }
+
+    private func qaInLocalRun(
+        ticketID: String, repository: RepositoryConfig, workspace: TicketWorkspace, qa: QAService,
+        onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> QASessionResult {
+        onProgress("Starting the app locally for QA")
+        let config = repository.localRun
+        var secrets: [String: String] = [:]
+        for name in config.secretNames {
+            if let value = (try? credentials.secret(for: .repository(repository.id, name))) ?? nil {
+                secrets[name] = value
+            }
+        }
+        let tools = try await ensureToolEnvironment()
+        let (updates, continuation) = AsyncStream<LocalRunStatus>.makeStream()
+        let consumer = Task {
+            for await status in updates { localRun = status }
+        }
+        let run: LocalRunStatus
+        do {
+            run = try await localEnvironment.start(
+                ticketID: ticketID, repositoryID: repository.id, worktree: workspace.worktreePath, mainCheckout: repository.path,
+                config: config, setupCommands: repository.setupCommands.filter(\.isEnabled).map(\.command),
+                optionalSetupCommands: Set(repository.setupCommands.filter { $0.isEnabled && $0.isOptional }.map(\.command)),
+                secrets: secrets, tools: tools
+            ) { continuation.yield($0) }
+            continuation.finish()
+            await consumer.value
+        } catch {
+            continuation.finish()
+            await consumer.value
+            throw error
+        }
+
+        var signInResult: LoginResult?
+        if repository.qa.login.isEnabled {
+            onProgress("Signing in")
+            signInResult = await signIn(run: run, repository: repository)
+            if signInResult == nil, !Task.isCancelled {
+                // A cold app can be slow on its first sign-in requests.
+                onProgress("Sign-in failed; trying once more")
+                signInResult = await signIn(run: run, repository: repository)
+            }
+            try Task.checkCancellation()
+            guard signInResult != nil else {
+                let reason = if case .failed(_, let message, _)? = qaSignIn { message } else { "sign-in failed" }
+                throw PipelineQAError.signInFailed(reason)
+            }
+        }
+        return try await qa.run(
+            ticketID: ticketID, repositoryName: repository.name, localRun: run, signIn: signInResult, qaTools: qaTools,
+            tools: tools, timeLimitMinutes: max(1, repository.qa.timeLimitMinutes), onProgress: onProgress
+        )
     }
 
     /// Finished sessions of a ticket, newest first.
@@ -856,7 +1316,9 @@ final class AppModel {
             } catch is CancellationError {
                 // Recorded as cancelled by the service.
             } catch {
-                lastError = error.localizedDescription
+                // Shown in a banner over whichever ticket is open, so say which one failed.
+                let name = tickets.first { $0.id == ticketID }?.externalID
+                lastError = name.map { "\($0): \(error.localizedDescription)" } ?? error.localizedDescription
             }
             continuation.finish()
             await consumer.value
@@ -901,7 +1363,8 @@ final class AppModel {
     /// Runs already in progress keep the services they started with.
     private func rebuildServices() {
         services = Self.makeServices(
-            database: orchestrator.database, workspace: workspaceSettings, agent: agentSettings, artifacts: artifacts
+            database: orchestrator.database, workspace: workspaceSettings, agent: agentSettings, artifacts: artifacts,
+            buildGate: buildGate, pipelineQA: pipelineQA, usageRelay: usageRelay
         )
     }
 
@@ -911,8 +1374,12 @@ final class AppModel {
         guard recoveredDatabasePath != databaseLocation else { return }
         recoveredDatabasePath = databaseLocation
         do {
-            for group in try await orchestrator.database.unfinishedProcessGroups() {
-                await ProcessRunner.terminateOrphanedGroup(group, expectedCommand: "claude")
+            // In an isolated copy (often a snapshot of the real database) these are the installed
+            // app's live runs, not orphans.
+            if !AppDatabase.isIsolated {
+                for group in try await orchestrator.database.unfinishedProcessGroups() {
+                    await ProcessRunner.terminateOrphanedGroup(group, expectedCommand: "claude")
+                }
             }
             let interrupted = try await orchestrator.recoverInterruptedRuns()
             if !interrupted.isEmpty {
@@ -940,6 +1407,7 @@ final class AppModel {
             )
             await reload()
             selection = [ticket.id]
+            await runAutopilot()
         } catch {
             lastError = "Could not create the ticket: \(error.localizedDescription)"
         }
@@ -950,10 +1418,11 @@ final class AppModel {
             tickets = try await orchestrator.database.tickets()
             states = try await orchestrator.database.workflowStates()
             unassignedIDs = try await orchestrator.database.unassignedTicketIDs()
+            unfollowedTickets = try await orchestrator.database.unfollowedTickets()
         } catch {
             lastError = "Could not load tickets: \(error)"
         }
-        let visible = Set(tickets.map(\.id))
+        let visible = Set((tickets + unfollowedTickets).map(\.id))
         if !selection.isSubset(of: visible) {
             selection.formIntersection(visible)
         }
@@ -1054,29 +1523,82 @@ final class AppModel {
         database: AppDatabase,
         workspace: WorkspaceSettings,
         agent: AgentSettings,
-        artifacts: ArtifactStore
+        artifacts: ArtifactStore,
+        buildGate: BuildGate,
+        pipelineQA: any PipelineQA,
+        usageRelay: UsageRelay
     ) -> Services {
         let runner: any AgentRunner = if let executable = ClaudeCLI.resolve(configuredPath: agent.claudePath) {
             ClaudeCodeRunner(
                 executable: executable, model: agent.model,
                 investigationTimeout: .seconds(max(1, agent.investigationTimeoutMinutes) * 60),
-                implementationTimeout: .seconds(max(1, agent.implementationTimeoutMinutes) * 60)
+                implementationTimeout: .seconds(max(1, agent.implementationTimeoutMinutes) * 60),
+                onUsage: { usageRelay.send($0) }
             )
         } else {
             UnavailableAgentRunner(reason: "Claude Code was not found. Set its location in Settings → Agent.")
         }
         let worktrees = GitWorktreeManager(worktreeRoot: workspace.resolvedWorktreeRoot)
-        let implementation = ImplementationService(database: database, worktrees: worktrees, runner: runner, artifacts: artifacts)
+        let implementation = ImplementationService(
+            database: database, worktrees: worktrees, runner: runner, artifacts: artifacts, buildGate: buildGate
+        )
         let qa = (runner as? any QARunner).map { QAService(database: database, worktrees: worktrees, runner: $0, artifacts: artifacts) }
         return Services(
             investigation: InvestigationService(database: database, worktrees: worktrees, runner: runner, artifacts: artifacts),
             implementation: implementation,
             verification: VerificationService(
                 database: database, worktrees: worktrees, runner: runner, implementation: implementation,
-                validationTimeout: .seconds(max(1, agent.validationTimeoutMinutes) * 60), artifacts: artifacts
+                validationTimeout: .seconds(max(1, agent.validationTimeoutMinutes) * 60), artifacts: artifacts,
+                buildGate: buildGate, qa: pipelineQA
             ),
             qa: qa
         )
+    }
+}
+
+enum PipelineQAError: Error, LocalizedError {
+    case unavailable(String)
+    case signInFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable(let reason): reason
+        case .signInFailed(let reason): "QA sign-in failed: \(reason)"
+        }
+    }
+}
+
+/// Hands usage readings from agent runs (any thread) to the app model, which is set up after
+/// the services that report them.
+final class UsageRelay: Sendable {
+    private let handler = Mutex<(@Sendable (ClaudeUsage) -> Void)?>(nil)
+
+    func setHandler(_ handler: @escaping @Sendable (ClaudeUsage) -> Void) {
+        self.handler.withLock { $0 = handler }
+    }
+
+    func send(_ usage: ClaudeUsage) {
+        handler.withLock { $0 }?(usage)
+    }
+}
+
+/// Hands pipeline QA from the verification service to the app model, which owns the local
+/// environment. The model is set after its initialiser has built the services.
+@MainActor
+final class PipelineQABridge: PipelineQA {
+    weak var model: AppModel?
+
+    nonisolated func runQA(
+        ticketID: String, repository: RepositoryConfig, onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> QASessionResult {
+        try await forward(ticketID: ticketID, repository: repository, onProgress: onProgress)
+    }
+
+    private func forward(
+        ticketID: String, repository: RepositoryConfig, onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> QASessionResult {
+        guard let model else { throw CancellationError() }
+        return try await model.runPipelineQA(ticketID: ticketID, repository: repository, onProgress: onProgress)
     }
 }
 

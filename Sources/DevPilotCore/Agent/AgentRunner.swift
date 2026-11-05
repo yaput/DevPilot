@@ -37,13 +37,23 @@ public struct ImplementationRequest: Sendable {
     public let logURL: URL
     /// Set for a fix of an existing implementation: what to fix (failing tests, review findings).
     public let fixInstructions: String?
+    /// The agent session, kept so a stopped run can be continued. nil: not kept.
+    public let sessionID: String?
+    /// Continues `sessionID` (a run that was stopped) instead of starting it.
+    public let continuesSession: Bool
+    /// Files an earlier, unfinished attempt left changed in the worktree, to build on rather than redo.
+    public let earlierChanges: [String]
     public let onLaunch: (@Sendable (pid_t) -> Void)?
 
     public init(
         ticket: Ticket, workspace: TicketWorkspace, plan: DecisionDocument, allowedCommands: [String],
         commonGitDirectory: String, tools: ToolEnvironment, logURL: URL, fixInstructions: String? = nil,
+        sessionID: String? = nil, continuesSession: Bool = false, earlierChanges: [String] = [],
         onLaunch: (@Sendable (pid_t) -> Void)? = nil
     ) {
+        self.earlierChanges = earlierChanges
+        self.sessionID = sessionID
+        self.continuesSession = continuesSession && sessionID != nil
         self.ticket = ticket
         self.workspace = workspace
         self.plan = plan
@@ -63,6 +73,8 @@ public struct ReviewRequest: Sendable {
     /// The implementer's own account, to be checked rather than trusted.
     public let implementation: ImplementationReport?
     public let validation: ValidationResult
+    /// The pipeline's QA session, when the repository runs one.
+    public let qa: QASessionResult?
     /// `git diff` of the worktree against its base (truncated if very large).
     public let diff: String
     public let commonGitDirectory: String
@@ -71,9 +83,10 @@ public struct ReviewRequest: Sendable {
 
     public init(
         ticket: Ticket, workspace: TicketWorkspace, plan: DecisionDocument, implementation: ImplementationReport?,
-        validation: ValidationResult, diff: String, commonGitDirectory: String, logURL: URL,
+        validation: ValidationResult, qa: QASessionResult? = nil, diff: String, commonGitDirectory: String, logURL: URL,
         onLaunch: (@Sendable (pid_t) -> Void)? = nil
     ) {
+        self.qa = qa
         self.ticket = ticket
         self.workspace = workspace
         self.plan = plan
@@ -114,6 +127,9 @@ public protocol QARunner: Sendable {
         _ request: QARequest,
         onProgress: @escaping @Sendable (String) -> Void
     ) async throws -> (QAReport, AgentRunStats)
+
+    /// Rewrites a repository's QA notes after a session, with a small model and no tools.
+    func updateQAMemory(_ request: QAMemoryRequest) async throws -> (QAMemoryUpdate, AgentRunStats)
 }
 
 extension ClaudeCodeRunner: QARunner {}
@@ -122,6 +138,8 @@ public enum AgentError: Error, Equatable, LocalizedError {
     case notConfigured(String)
     case notLoggedIn(String)
     case timedOut(minutes: Int)
+    /// No output for this long: stuck, not just slow.
+    case stalled(minutes: Int)
     case failed(String)
     case invalidOutput(String)
 
@@ -130,6 +148,7 @@ public enum AgentError: Error, Equatable, LocalizedError {
         case .notConfigured(let reason): reason
         case .notLoggedIn(let detail): "Claude Code is not logged in. Run `claude` in Terminal and log in, then try again. (\(detail))"
         case .timedOut(let minutes): "The agent did not finish within \(minutes) minutes and was stopped."
+        case .stalled(let minutes): "The agent produced no output for \(minutes) minutes and was stopped, so it was probably stuck."
         case .failed(let message): "The agent failed: \(message)"
         case .invalidOutput(let message): "The agent returned an unusable result: \(message)"
         }

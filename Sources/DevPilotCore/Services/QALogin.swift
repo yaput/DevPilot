@@ -5,6 +5,9 @@ public struct QAConfig: Codable, Sendable, Hashable {
     public var login = LoginConfig()
     /// How long the QA agent explores before it must report.
     public var timeLimitMinutes = 15
+    /// After tests pass, run the app locally and have the QA agent test it before the review.
+    /// Reproduced bugs go to the automatic fix loop.
+    public var runInPipeline = false
 
     public init() {}
 
@@ -13,6 +16,7 @@ public struct QAConfig: Codable, Sendable, Hashable {
         self.init()
         login = try container.decodeIfPresent(LoginConfig.self, forKey: .login) ?? LoginConfig()
         timeLimitMinutes = try container.decodeIfPresent(Int.self, forKey: .timeLimitMinutes) ?? timeLimitMinutes
+        runInPipeline = try container.decodeIfPresent(Bool.self, forKey: .runInPipeline) ?? runInPipeline
     }
 }
 

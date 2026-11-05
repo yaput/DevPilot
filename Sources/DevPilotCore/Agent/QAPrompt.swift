@@ -124,15 +124,18 @@ public struct QARequest: Sendable {
     public let mcpConfigPath: String
     public let sessionDirectory: String
     public let timeLimitMinutes: Int
+    /// Notes from earlier sessions on this repository's app (`QAMemoryStore`).
+    public let memory: String?
     public let logURL: URL
     public let onLaunch: (@Sendable (pid_t) -> Void)?
 
     public init(
         ticket: Ticket, workspace: TicketWorkspace, plan: DecisionDocument?, changedFiles: [String], appURL: String,
         signedIn: Bool, serviceLogs: [(name: String, path: String)], logDirectory: String, excludedDirectory: String,
-        mcpConfigPath: String, sessionDirectory: String, timeLimitMinutes: Int, logURL: URL,
+        mcpConfigPath: String, sessionDirectory: String, timeLimitMinutes: Int, memory: String? = nil, logURL: URL,
         onLaunch: (@Sendable (pid_t) -> Void)? = nil
     ) {
+        self.memory = memory
         self.ticket = ticket
         self.workspace = workspace
         self.plan = plan
@@ -183,6 +186,18 @@ enum QAPrompt {
             ?? "No approved plan is recorded for this ticket."
         let files = request.changedFiles.isEmpty ? "None recorded." : request.changedFiles.prefix(200).map { "- \($0)" }.joined(separator: "\n")
         let logs = request.serviceLogs.map { "- \($0.name): \($0.path)" }.joined(separator: "\n")
+        let memory = request.memory.map {
+            """
+            ## Notes from earlier QA sessions on this app
+            Written by DevPilot from earlier sessions on other tickets. Use them to get around faster, but check \
+            before relying on them: the app may have changed. Reports listed as false alarms were not bugs then.
+            <qa_notes>
+            \($0)
+            </qa_notes>
+
+
+            """
+        } ?? ""
         return """
             Test the change for this ticket in the running app, like an experienced QA engineer would, and report bugs.
 
@@ -233,7 +248,7 @@ enum QAPrompt {
              {"action":"expect_no_console_errors","by":"","selector":"","name":"","value":""}]
             Put doubts, flaky behaviour and things you could not test in `notes` or `coverage`, not in `findings`.
 
-            ## Changed files on this branch
+            \(memory)## Changed files on this branch
             \(files)
 
             \(plan)

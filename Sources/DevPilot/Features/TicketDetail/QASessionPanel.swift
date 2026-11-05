@@ -27,8 +27,6 @@ struct QASessionPanel: View {
                 if let past { ResultView(result: past) }
             }
         }
-        .padding(10)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func header(_ session: QASessionState?) -> some View {

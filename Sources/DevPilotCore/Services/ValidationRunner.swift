@@ -43,13 +43,26 @@ enum SeatbeltProfile {
 /// Runs the repository's validation commands in the worktree, each inside the Seatbelt
 /// sandbox, and records exit codes and full logs.
 public struct ValidationRunner: Sendable {
+    /// What a ticket changed, for commands that test only that: `DEVPILOT_BASE_COMMIT` and
+    /// `DEVPILOT_CHANGED_FILES` (repository-relative paths, one per line, deleted files left out),
+    /// e.g. `pnpm vitest related --run $DEVPILOT_CHANGED_FILES`.
+    public static func changeEnvironment(baseCommit: String, changedFiles: [ChangedFile]) -> [String: String] {
+        [
+            "DEVPILOT_BASE_COMMIT": baseCommit,
+            "DEVPILOT_CHANGED_FILES": changedFiles.filter { $0.change != .deleted }.map(\.path).joined(separator: "\n"),
+        ]
+    }
+
     static let sandboxExec = URL(filePath: "/usr/bin/sandbox-exec")
     static let tailLines = 60
 
     private let timeoutPerCommand: Duration
+    /// Each command waits for it, so the timeout covers running, not waiting. nil: no waiting.
+    private let buildGate: BuildGate?
 
-    public init(timeoutPerCommand: Duration) {
+    public init(timeoutPerCommand: Duration, buildGate: BuildGate? = nil) {
         self.timeoutPerCommand = timeoutPerCommand
+        self.buildGate = buildGate
     }
 
     public func run(
@@ -59,6 +72,8 @@ public struct ValidationRunner: Sendable {
         tools: ToolEnvironment,
         logDirectory: URL,
         fixAttempt: Int,
+        /// Extra variables for every command, e.g. `changeEnvironment(...)`.
+        environment extra: [String: String] = [:],
         onProgress: @escaping @Sendable (String) -> Void,
         onLaunch: (@Sendable (pid_t) -> Void)? = nil
     ) async throws -> ValidationResult {
@@ -73,17 +88,25 @@ public struct ValidationRunner: Sendable {
 
         var results: [ValidationCommandResult] = []
         for (index, command) in commands.enumerated() {
-            onProgress("Running `\(command)`")
-            let started = ContinuousClock.now
-            let output = try await ProcessRunner.run(ProcessRequest(
+            let request = ProcessRequest(
                 executable: Self.sandboxExec,
                 arguments: ["-f", profileURL.path, "/bin/sh", "-c", command],
                 workingDirectory: URL(filePath: worktree, directoryHint: .isDirectory),
-                environment: tools.variables(base: ClaudeCodeRunner.environment()),
+                environment: tools.variables(base: ClaudeCodeRunner.environment()).merging(extra) { _, new in new },
                 timeout: timeoutPerCommand,
                 onLaunch: onLaunch
-            ))
-            let elapsed = ContinuousClock.now - started
+            )
+            let run: @Sendable () async throws -> (ProcessResult, Duration) = {
+                onProgress("Running `\(command)`")
+                let started = ContinuousClock.now
+                let output = try await ProcessRunner.run(request)
+                return (output, ContinuousClock.now - started)
+            }
+            let (output, elapsed) = if let buildGate {
+                try await buildGate.run(onWait: onProgress, run)
+            } else {
+                try await run()
+            }
             let text = output.stdoutText + (output.stderrText.isEmpty ? "" : "\n" + output.stderrText)
             let logURL = logDirectory.appending(path: "command-\(index + 1).log")
             try? "$ \(command)\n\n\(text)".write(to: logURL, atomically: true, encoding: .utf8)

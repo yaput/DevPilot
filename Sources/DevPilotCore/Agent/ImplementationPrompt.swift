@@ -17,6 +17,17 @@ enum ImplementationPrompt {
         - Finish by returning the requested structured report.
         """
 
+    /// The next message in a session that was stopped (time limit, Stop, failure): the agent
+    /// still has its context, and the worktree has its changes.
+    static func continuation(_ request: ImplementationRequest) -> String {
+        """
+        Your previous turn was stopped before you finished (time limit, a stop by the user, or an error). \
+        Your changes so far are still in the worktree. Continue from where you stopped: check `git status` and \
+        `git diff` if you need to, finish the remaining plan steps, run the relevant checks, then return the \
+        structured implementation report for the whole implementation. Do not start over or redo finished work.
+        """
+    }
+
     static func render(_ request: ImplementationRequest) -> String {
         let commands = request.allowedCommands.isEmpty
             ? "No shell commands are available; make the changes with the file tools only."
@@ -35,9 +46,17 @@ enum ImplementationPrompt {
 
             """
         } ?? ""
+        let earlier = request.earlierChanges.isEmpty || request.fixInstructions != nil ? "" : """
+
+            ## Earlier work in this worktree
+            An earlier attempt was stopped before it finished and left these files changed:
+            \(request.earlierChanges.prefix(100).map { "- \($0)" }.joined(separator: "\n"))
+            Review them with `git diff` first. Keep what is correct and continue from there; do not redo finished steps.
+
+            """
         return """
             Implement the approved plan for this ticket.
-            \(fix)
+            \(fix)\(earlier)
             ## How to work
             1. Read the repository's guidance first if present: CLAUDE.md, AGENTS.md, CONTRIBUTING.md. Follow its conventions.
             2. Make the changes the plan describes, step by step, matching the surrounding code's style.

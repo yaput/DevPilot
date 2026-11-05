@@ -20,6 +20,50 @@ struct ValidationSandboxTests {
         return (result, workspace)
     }
 
+    @Test func sharedBuildGateKeepsTicketsFromBuildingAtOnce() async throws {
+        let repo = try await TestRepository(base: URL(filePath: NSHomeDirectory()))
+        defer { repo.remove() }
+        let workspace = try await repo.manager.prepareWorktree(for: .sample(), repository: repo.config)
+        let common = try await repo.manager.commonGitDirectory(of: workspace.worktreePath)
+        let gate = BuildGate(limit: 1, pressure: { .normal })
+        let waited = Mutex(false)
+        let started = ContinuousClock.now
+        // Two tickets' validations, each one 0.4 s command, through one build slot.
+        try await withThrowingTaskGroup(of: ValidationResult.self) { group in
+            for index in 0..<2 {
+                group.addTask {
+                    try await ValidationRunner(timeoutPerCommand: .seconds(30), buildGate: gate).run(
+                        commands: ["sleep 0.4"], worktree: workspace.worktreePath, commonGitDirectory: common,
+                        tools: ToolEnvironment(path: ProcessInfo.processInfo.environment["PATH"] ?? "", javaHome: ""),
+                        logDirectory: repo.root.appending(path: "logs-\(index)"), fixAttempt: 0,
+                        onProgress: { if $0.hasPrefix("Waiting for a free build slot") { waited.withLock { $0 = true } } }
+                    )
+                }
+            }
+            for try await result in group { #expect(result.passed) }
+        }
+        #expect(ContinuousClock.now - started >= .milliseconds(800))
+        #expect(waited.withLock { $0 })
+    }
+
+    @Test func commandsSeeWhatTheTicketChanged() async throws {
+        let repo = try await TestRepository(base: URL(filePath: NSHomeDirectory()))
+        defer { repo.remove() }
+        let workspace = try await repo.manager.prepareWorktree(for: .sample(), repository: repo.config)
+        try "new\n".write(to: URL(filePath: workspace.worktreePath).appending(path: "added.txt"), atomically: true, encoding: .utf8)
+        let changed = try await repo.manager.changedFiles(in: workspace.worktreePath)
+        let result = try await ValidationRunner(timeoutPerCommand: .seconds(30)).run(
+            commands: [#"test "$DEVPILOT_CHANGED_FILES" = "added.txt" && test "$DEVPILOT_BASE_COMMIT" = "\#(workspace.baseCommit)""#],
+            worktree: workspace.worktreePath,
+            commonGitDirectory: try await repo.manager.commonGitDirectory(of: workspace.worktreePath),
+            tools: ToolEnvironment(path: ProcessInfo.processInfo.environment["PATH"] ?? "", javaHome: ""),
+            logDirectory: repo.root.appending(path: "logs"), fixAttempt: 0,
+            environment: ValidationRunner.changeEnvironment(baseCommit: workspace.baseCommit, changedFiles: changed),
+            onProgress: { _ in }
+        )
+        #expect(result.passed, "\(result.commands.first?.outputTail ?? "")")
+    }
+
     @Test func recordsExitCodesLogsAndTails() async throws {
         let repo = try await TestRepository(base: URL(filePath: NSHomeDirectory()))
         defer { repo.remove() }
@@ -518,5 +562,193 @@ struct PushStatusTests {
         let status = try #require(await fixture.repo.manager.branchStatus(fixture.workspace))
         #expect(status.upstream == nil)
         #expect(status.unpushedCommits == 1)
+    }
+}
+
+/// Stands in for the app's pipeline QA: returns prepared sessions in order, or throws.
+final class FakePipelineQA: PipelineQA, @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [Result<QASessionResult, Error>]
+    private(set) var calls = 0
+
+    init(_ results: [Result<QASessionResult, Error>]) {
+        self.results = results
+    }
+
+    func runQA(ticketID: String, repository: RepositoryConfig, onProgress: @escaping @Sendable (String) -> Void) async throws -> QASessionResult {
+        let next: Result<QASessionResult, Error> = lock.withLock {
+            calls += 1
+            return results.count > 1 ? results.removeFirst() : results[0]
+        }
+        return try next.get()
+    }
+
+    /// A session with one bug per status given.
+    static func session(_ statuses: [QAReplayResult.Status]) -> QASessionResult {
+        let findings = statuses.indices.map { index in
+            QAFinding(
+                title: "Bug \(index + 1)", severity: .major, category: "functional", pageURL: "http://localhost:3000/x",
+                steps: ["Open x"], expected: "It saves", actual: "It does not", evidence: "500 in log", reproduction: []
+            )
+        }
+        return QASessionResult(
+            directory: "/tmp/qa", report: QAReport(summary: "Tested x", coverage: [], findings: findings, notes: []),
+            replays: statuses.map { QAReplayResult(status: $0, attempts: []) },
+            startedAt: Date(), finishedAt: Date(), reportPath: "/tmp/qa/qa-report.md"
+        )
+    }
+}
+
+struct PipelineQATests {
+    func verification(_ ticket: ImplementedTicket, _ runner: FakeAgentRunner, qa: FakePipelineQA) -> VerificationService {
+        VerificationService(
+            database: ticket.db, worktrees: ticket.fixture.repo.manager, runner: runner,
+            implementation: ticket.fixture.service(runner), validationTimeout: .seconds(60), artifacts: ticket.fixture.artifacts,
+            qa: qa
+        )
+    }
+
+    func repository(_ ticket: ImplementedTicket, qa: Bool) -> RepositoryConfig {
+        var config = ticket.repository(["true"])
+        config.qa.runInPipeline = qa
+        return config
+    }
+
+    @Test func qaRunsAfterPassingTestsAndReachesTheReviewer() async throws {
+        let ticket = try await ImplementedTicket()
+        defer { ticket.fixture.repo.remove() }
+        let runner = FakeAgentRunner()
+        let qa = FakePipelineQA([.success(FakePipelineQA.session([]))])
+
+        _ = try await verification(ticket, runner, qa: qa).verify(
+            ticketID: ticket.id, repository: repository(ticket, qa: true), tools: ticket.tools, maxFixAttempts: 1
+        ) { _ in }
+
+        #expect(qa.calls == 1)
+        let runs = try await ticket.db.runs(ticketID: ticket.id)
+        #expect(runs.map(\.kind).suffix(3) == [.validation, .qa, .review])
+        #expect(runs.first { $0.kind == .qa }?.qa?.report.summary == "Tested x")
+        #expect(runner.reviews.first?.qa?.report.summary == "Tested x")
+        #expect(try await ticket.db.state(of: ticket.id) == .readyForHumanReview)
+    }
+
+    @Test func reproducedBugsGoToTheFixLoopThenEverythingRunsAgain() async throws {
+        let ticket = try await ImplementedTicket()
+        defer { ticket.fixture.repo.remove() }
+        let runner = FakeAgentRunner()
+        // First session: one reproduced and one unconfirmed bug; after the fix, none.
+        let qa = FakePipelineQA([.success(FakePipelineQA.session([.confirmed, .notReproduced])), .success(FakePipelineQA.session([]))])
+
+        _ = try await verification(ticket, runner, qa: qa).verify(
+            ticketID: ticket.id, repository: repository(ticket, qa: true), tools: ticket.tools, maxFixAttempts: 1
+        ) { _ in }
+
+        #expect(qa.calls == 2)
+        let fix = try #require(runner.implementations.first?.fixInstructions)
+        #expect(fix.contains("Bug 1") && !fix.contains("Bug 2"), "only reproduced bugs are sent: \(fix)")
+        let kinds = try await ticket.db.runs(ticketID: ticket.id).map(\.kind)
+        #expect(kinds.suffix(6) == [.validation, .qa, .implementation, .validation, .qa, .review])
+        #expect(try await ticket.db.state(of: ticket.id) == .readyForHumanReview)
+    }
+
+    @Test func bugsLeftAfterTheLastAttemptAreHandedOffNotHidden() async throws {
+        let ticket = try await ImplementedTicket()
+        defer { ticket.fixture.repo.remove() }
+        let runner = FakeAgentRunner()
+        let qa = FakePipelineQA([.success(FakePipelineQA.session([.confirmed]))])
+
+        _ = try await verification(ticket, runner, qa: qa).verify(
+            ticketID: ticket.id, repository: repository(ticket, qa: true), tools: ticket.tools, maxFixAttempts: 0
+        ) { _ in }
+
+        #expect(runner.implementations.isEmpty)
+        #expect(runner.reviews.first?.qa?.confirmedCount == 1)
+        #expect(try await ticket.db.state(of: ticket.id) == .readyForHumanReview)
+    }
+
+    @Test func qaThatCannotRunIsRecordedAndTheReviewStillHappens() async throws {
+        let ticket = try await ImplementedTicket()
+        defer { ticket.fixture.repo.remove() }
+        let runner = FakeAgentRunner()
+        let qa = FakePipelineQA([.failure(LocalRunError.notConfigured)])
+
+        _ = try await verification(ticket, runner, qa: qa).verify(
+            ticketID: ticket.id, repository: repository(ticket, qa: true), tools: ticket.tools, maxFixAttempts: 1
+        ) { _ in }
+
+        let qaRun = try #require(try await ticket.db.runs(ticketID: ticket.id).first { $0.kind == .qa })
+        #expect(qaRun.outcome == .failed)
+        #expect(runner.reviews.first?.qa == nil)
+        #expect(try await ticket.db.state(of: ticket.id) == .readyForHumanReview)
+    }
+
+    @Test func noQAUnlessTheRepositoryAsks() async throws {
+        let ticket = try await ImplementedTicket()
+        defer { ticket.fixture.repo.remove() }
+        let qa = FakePipelineQA([.success(FakePipelineQA.session([]))])
+
+        _ = try await verification(ticket, FakeAgentRunner(), qa: qa).verify(
+            ticketID: ticket.id, repository: repository(ticket, qa: false), tools: ticket.tools, maxFixAttempts: 1
+        ) { _ in }
+
+        #expect(qa.calls == 0)
+        #expect(try await ticket.db.state(of: ticket.id) == .readyForHumanReview)
+    }
+
+    @Test func noQAWhileTestsFail() async throws {
+        let ticket = try await ImplementedTicket()
+        defer { ticket.fixture.repo.remove() }
+        let qa = FakePipelineQA([.success(FakePipelineQA.session([]))])
+        var config = ticket.repository(["exit 1"])
+        config.qa.runInPipeline = true
+
+        _ = try await verification(ticket, FakeAgentRunner(), qa: qa).verify(
+            ticketID: ticket.id, repository: config, tools: ticket.tools, maxFixAttempts: 0
+        ) { _ in }
+
+        #expect(qa.calls == 0)
+        #expect(try await ticket.db.state(of: ticket.id) == .readyForHumanReview)
+    }
+}
+
+struct QAMemoryTests {
+    @Test func storesTrimsAndForgetsNotesPerRepository() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "qa-memory-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = QAMemoryStore(artifacts: ArtifactStore(root: root))
+        #expect(store.read(repositoryID: "r1") == nil)
+
+        try store.write("  # App\n- Save is in the header\n\n", repositoryID: "r1")
+        #expect(store.read(repositoryID: "r1") == "# App\n- Save is in the header")
+        #expect(store.read(repositoryID: "r2") == nil)
+
+        try store.write(String(repeating: "x", count: QAMemoryStore.maxCharacters + 500), repositoryID: "r1")
+        #expect(store.read(repositoryID: "r1")?.count == QAMemoryStore.maxCharacters)
+
+        store.forget(repositoryID: "r1")
+        #expect(store.read(repositoryID: "r1") == nil)
+    }
+
+    @Test func promptCarriesReplayVerdictsAndOldNotes() {
+        let session = FakePipelineQA.session([.confirmed, .notReproduced])
+        let prompt = QAMemoryPrompt.render(QAMemoryRequest(
+            repositoryName: "omakase-v2", previous: "- Save is in the header", ticket: .sample(), session: session,
+            workingDirectory: "/tmp", logURL: URL(filePath: "/tmp/memory.jsonl")
+        ))
+        #expect(prompt.contains("- Save is in the header"))
+        #expect(prompt.contains("[REPRODUCED] Bug 1"))
+        #expect(prompt.contains("[NOT REPRODUCED] Bug 2"))
+    }
+
+    @Test func qaPromptIncludesNotesOnlyWhenThereAreAny() throws {
+        func request(memory: String?) -> QARequest {
+            QARequest(
+                ticket: .sample(), workspace: TicketWorkspace.sample(), plan: nil, changedFiles: [], appURL: "http://localhost:3000",
+                signedIn: false, serviceLogs: [], logDirectory: "/tmp", excludedDirectory: "/tmp/x", mcpConfigPath: "/tmp/m.json",
+                sessionDirectory: "/tmp", timeLimitMinutes: 10, memory: memory, logURL: URL(filePath: "/tmp/a.jsonl")
+            )
+        }
+        #expect(QAPrompt.render(request(memory: "- Use the Leads tab")).contains("<qa_notes>\n- Use the Leads tab\n</qa_notes>"))
+        #expect(!QAPrompt.render(request(memory: nil)).contains("qa_notes"))
     }
 }

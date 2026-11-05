@@ -44,6 +44,19 @@ private struct ProvidersSettingsView: View {
         VStack(spacing: 0) {
             Form {
                 Section {
+                    Picker("Sync in the background", selection: $form.draft.syncIntervalMinutes) {
+                        ForEach(ProviderSettings.syncIntervalChoices, id: \.self) { minutes in
+                            Text(minutes == 0 ? "Off" : "Every \(minutes) minutes").tag(minutes)
+                        }
+                    }
+                } footer: {
+                    Text("""
+                        New tickets show up on their own and you get a notification. While autopilot investigates new \
+                        tickets for a repository, DevPilot syncs at least every 5 minutes, even when this is off.
+                        """)
+                }
+
+                Section {
                     Toggle("Use sample data instead of Shortcut and Jira", isOn: $form.draft.useSampleData)
                 } footer: {
                     Text("Sample data is stored in a separate database, so it never mixes with real tickets.")

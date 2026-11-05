@@ -14,9 +14,12 @@ struct LocalRunPanel: View {
             runView(run, repository: repository)
         } else if let other = model.localRun, !isFinished(other) {
             HStack {
-                Label("The app is running locally for another ticket.", systemImage: "play.circle")
+                Label(model.pipelineQATicketID == nil ? "The app is running locally for another ticket."
+                      : "DevPilot is testing another ticket locally (pipeline QA).", systemImage: "play.circle")
                     .foregroundStyle(.secondary)
-                Button("Stop It") { Task { await model.stopLocalRun() } }
+                if model.pipelineQATicketID == nil {
+                    Button("Stop It") { Task { await model.stopLocalRun() } }
+                }
             }
             .font(.callout)
         } else if repository?.localRun.isConfigured == true {
@@ -65,7 +68,13 @@ struct LocalRunPanel: View {
                     Button("Open in Browser") { NSWorkspace.shared.open(url) }
                         .buttonStyle(.borderedProminent)
                 }
-                if isFinished(run) {
+                if model.pipelineQATicketID == ticket.id {
+                    // Owned by the run's QA step; stopping the run stops it.
+                    Label("Pipeline QA", systemImage: "ladybug")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("DevPilot started this app to test the ticket and stops it when the QA session ends.")
+                } else if isFinished(run) {
                     Button("Dismiss") { model.dismissLocalRunResult() }
                 } else {
                     Button("Stop", role: .destructive) { Task { await model.stopLocalRun() } }
@@ -99,8 +108,6 @@ struct LocalRunPanel: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .padding(10)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
     }
 
     /// Signs in the way a QA session will, and shows what the saved session opens.

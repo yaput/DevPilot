@@ -15,32 +15,61 @@ struct HandoffPanel: View {
     var body: some View {
         let validation = detail.latestValidation?.validation
         let review = detail.latestReview?.review
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 12) {
+        let qa = detail.latestQA?.qa
+        // Failing tests, reproduced bugs or requested changes make fixing, not finishing, the next step.
+        let needsFix = validation?.passed == false || (review.map { $0.verdict != .approve } ?? false) || (qa?.confirmedCount ?? 0) > 0
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
                 if let validation {
-                    Label(
-                        validation.commands.isEmpty ? "No tests configured" : validation.passed ? "Tests passed" : "\(validation.failed.count) failing",
-                        systemImage: validation.passed ? "checkmark.circle.fill" : "xmark.circle.fill"
+                    ResultChip(
+                        text: validation.commands.isEmpty ? "No tests configured"
+                            : validation.passed ? "Tests passed" : "\(validation.failed.count) of \(validation.commands.count) checks failing",
+                        systemImage: validation.passed ? "checkmark.circle.fill" : "xmark.circle.fill",
+                        tint: validation.commands.isEmpty ? .secondary : validation.passed ? .green : .red
                     )
-                    .foregroundStyle(validation.commands.isEmpty ? Color.secondary : validation.passed ? .green : .red)
+                }
+                if let qa {
+                    let bugs = qa.report.findings.count
+                    ResultChip(
+                        text: bugs == 0 ? "QA found no bugs"
+                            : qa.confirmedCount > 0 ? "QA reproduced \(qa.confirmedCount) bug\(qa.confirmedCount == 1 ? "" : "s")"
+                            : "QA: \(bugs) unconfirmed",
+                        systemImage: "ladybug.fill",
+                        tint: bugs == 0 ? .green : qa.confirmedCount > 0 ? .red : .orange
+                    )
+                } else if detail.latestQA?.outcome == .failed {
+                    ResultChip(text: "QA could not run", systemImage: "ladybug", tint: .secondary)
                 }
                 if let review {
-                    Label(review.verdict == .approve ? "Review: approve" : "Review: changes requested",
-                          systemImage: review.verdict == .approve ? "hand.thumbsup.fill" : "exclamationmark.bubble.fill")
-                        .foregroundStyle(review.verdict == .approve ? .green : .orange)
+                    ResultChip(
+                        text: review.verdict == .approve ? "Review approved" : "Review requests changes",
+                        systemImage: review.verdict == .approve ? "hand.thumbsup.fill" : "exclamationmark.bubble.fill",
+                        tint: review.verdict == .approve ? .green : .orange
+                    )
                 }
             }
-            .font(.headline)
             Text("Review the changes in your IDE and commit them yourself. DevPilot never commits or pushes.")
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(.secondary)
             HStack {
-                Button("Fix with Claude…") { fixing = true }
-                Button("Run Tests & Review Again") { model.startVerification(ticket.id, repositoryID: repositoryID) }
+                if needsFix {
+                    Button { fixing = true } label: { Label("Fix with Claude…", systemImage: "wand.and.stars") }
+                        .buttonStyle(.borderedProminent)
+                } else {
+                    Button { fixing = true } label: { Label("Fix with Claude…", systemImage: "wand.and.stars") }
+                }
+                Button { model.startVerification(ticket.id, repositoryID: repositoryID) } label: {
+                    Label("Run Tests & Review Again", systemImage: "arrow.clockwise")
+                }
                 Spacer()
-                Button("Mark as Done…") { finishing = true }
-                    .buttonStyle(.borderedProminent)
+                if needsFix {
+                    Button("Mark as Done…") { finishing = true }
+                } else {
+                    Button { finishing = true } label: { Label("Mark as Done…", systemImage: "checkmark") }
+                        .buttonStyle(.borderedProminent)
+                }
             }
+            .controlSize(.large)
         }
         .sheet(isPresented: $fixing) {
             FixRequestSheet(ticket: ticket, validation: validation, review: review) { instructions in
@@ -63,7 +92,18 @@ struct VerificationSection: View {
         VStack(alignment: .leading, spacing: 14) {
             if let run = detail.latestValidation, let validation = run.validation {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(validation.fixAttempt > 0 ? "Tests (after fix attempt \(validation.fixAttempt))" : "Tests").font(.headline)
+                    SectionHeader(title: validation.fixAttempt > 0 ? "Tests (after fix attempt \(validation.fixAttempt))" : "Tests",
+                                  systemImage: "testtube.2") {
+                        Text(run.startedAt.formatted(.relative(presentation: .named)))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help(run.startedAt.formatted(date: .abbreviated, time: .standard))
+                        if !validation.commands.isEmpty {
+                            let passed = validation.commands.count - validation.failed.count
+                            Pill(text: "\(passed) of \(validation.commands.count) passed", tint: validation.passed ? .green : .red)
+                        }
+                    }
+                    .padding(.bottom, 4)
                     if validation.commands.isEmpty {
                         Text("No validation commands are configured for this repository.").foregroundStyle(.secondary)
                     }
@@ -91,11 +131,11 @@ struct VerificationSection: View {
                 }
             }
             if let run = detail.latestReview, let review = run.review {
+                if detail.latestValidation?.validation != nil { Divider() }
                 ReviewView(review: review, run: run, worktree: detail.workspace?.worktreePath)
             }
         }
-        .padding(16)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
+        .card()
     }
 }
 
@@ -108,12 +148,8 @@ private struct ReviewView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Independent review").font(.headline)
-                Text(review.verdict == .approve ? "Approve" : "Changes requested")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .foregroundStyle(review.verdict == .approve ? .green : .orange)
-                    .background((review.verdict == .approve ? Color.green : .orange).opacity(0.15), in: Capsule())
+                Label("Independent review", systemImage: "eye").font(.headline)
+                Pill(text: review.verdict == .approve ? "Approve" : "Changes requested", tint: review.verdict == .approve ? .green : .orange)
                 Spacer()
                 Button("review.md") {
                     let file = URL(filePath: run.logPath).deletingPathExtension().appendingPathExtension("md")
@@ -121,7 +157,7 @@ private struct ReviewView: View {
                 }
                 .controlSize(.small)
             }
-            Text(review.summary).textSelection(.enabled)
+            MarkdownView(markdown: review.summary)
             if review.findings.isEmpty {
                 Text("No findings.").foregroundStyle(.secondary)
             }
@@ -137,7 +173,7 @@ private struct ReviewView: View {
                                 .help("Open in \(model.preferredEditor?.name ?? "editor")")
                         }
                     }
-                    Text(finding.detail).font(.callout).textSelection(.enabled)
+                    MarkdownView(markdown: finding.detail).font(.callout)
                     if !finding.suggestion.isEmpty {
                         Text("Suggestion: \(finding.suggestion)").font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
                     }
@@ -166,6 +202,22 @@ private struct ReviewView: View {
     private func open(_ finding: ReviewReport.Finding) {
         guard let worktree, let editor = model.preferredEditor else { return }
         editor.open(URL(filePath: worktree).appending(path: finding.file), line: finding.line)
+    }
+}
+
+/// A test or review result in the hand-off card.
+private struct ResultChip: View {
+    let text: String
+    let systemImage: String
+    let tint: Color
+
+    var body: some View {
+        Label(text, systemImage: systemImage)
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(tint.opacity(0.12), in: Capsule())
     }
 }
 
@@ -278,6 +330,17 @@ private struct MarkDoneSheet: View {
     @State private var status: BranchStatus?
     @State private var removeWorktree = true
     @State private var loaded = false
+    @State private var isCommitting = false
+
+    private func commit() {
+        isCommitting = true
+        Task {
+            _ = await model.commitChanges(ticket.id)
+            status = await model.branchStatus(ticket.id)
+            removeWorktree = (status?.uncommittedFiles ?? 1) == 0
+            isCommitting = false
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -290,7 +353,21 @@ private struct MarkDoneSheet: View {
                          status.upstream.map { "Pushed to \($0)" } ?? "",
                          warning: status.upstream == nil ? "Not pushed" : "\(status.unpushedCommits) commit\(status.unpushedCommits == 1 ? "" : "s") not pushed")
                     if let files = status.uncommittedFiles {
-                        line(files == 0, "No uncommitted changes", warning: "\(files) uncommitted file\(files == 1 ? "" : "s") in the worktree")
+                        HStack {
+                            line(files == 0, "No uncommitted changes", warning: "\(files) uncommitted file\(files == 1 ? "" : "s") in the worktree")
+                            if files > 0 {
+                                Spacer()
+                                if isCommitting {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Button("Commit All") { commit() }
+                                        .controlSize(.small)
+                                        .disabled(model.commitBlocker(ticket.id) != nil)
+                                        .help(model.commitBlocker(ticket.id)
+                                              ?? "Commits them on \(status.branch) as “\(model.defaultCommitMessage(ticket.id))”. Nothing is pushed.")
+                                }
+                            }
+                        }
                     }
                 }
                 if status.uncommittedFiles != nil {
@@ -344,7 +421,6 @@ struct DonePanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label("Done", systemImage: "checkmark.seal.fill").foregroundStyle(.green).font(.headline)
             if let status {
                 Text("\(status.branch): \(status.commitsSinceBase) commit\(status.commitsSinceBase == 1 ? "" : "s")"
                      + (status.upstream.map { status.unpushedCommits == 0 ? ", pushed to \($0)" : ", \(status.unpushedCommits) not pushed" } ?? ", not pushed"))

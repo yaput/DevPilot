@@ -13,6 +13,15 @@ enum ReviewPrompt {
     /// Diffs bigger than this are cut; the reviewer can still read files and run `git diff` itself.
     static let maxDiffCharacters = 150_000
 
+    static func qaSection(_ qa: QASessionResult?) -> String {
+        guard let qa else { return "No QA session ran for this change." }
+        guard !qa.report.findings.isEmpty else { return "No bugs found. Summary: \(qa.report.summary)" }
+        return "Summary: \(qa.report.summary)\n" + zip(qa.report.findings, qa.replays).map { finding, replay in
+            "- [\(QAReportRenderer.label(replay.status))] \(finding.severity.rawValue): \(finding.title) (page \(finding.pageURL)). "
+                + "Expected: \(finding.expected) Actual: \(finding.actual)"
+        }.joined(separator: "\n")
+    }
+
     static func render(_ request: ReviewRequest) -> String {
         let diff = request.diff.count > maxDiffCharacters
             ? String(request.diff.prefix(maxDiffCharacters)) + "\n[diff truncated; run `git diff \(request.workspace.baseCommit.prefix(12))` for the rest]"
@@ -41,6 +50,8 @@ enum ReviewPrompt {
             3. Look for bugs, security problems, regressions in existing behaviour, missing or weak tests, and deviations \
             from the plan or the repository's conventions (CLAUDE.md, AGENTS.md, CONTRIBUTING.md if present).
             4. Take the validation results into account. Failing checks are at least a major finding unless clearly unrelated.
+            5. Take the QA results into account, if any. A bug DevPilot REPRODUCED in a fresh browser is at least a major \
+            finding unless the code shows it is unrelated to this change. Other reports are unconfirmed: check them in the code.
 
             ## Output
             - verdict: "approve" only if you would merge this as is; otherwise "changes_requested".
@@ -59,6 +70,9 @@ enum ReviewPrompt {
 
             ## Validation results (run by DevPilot)
             \(validation)
+
+            ## QA session (run by DevPilot in the running app)
+            \(Self.qaSection(request.qa))
 
             ## Implementer's report (unverified)
             \(implementer)

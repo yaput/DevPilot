@@ -1,5 +1,16 @@
 import Foundation
 
+/// A QA session for one ticket inside the pipeline: run the app locally, sign in, explore,
+/// replay, stop. The app supplies it, because it owns the single local environment and the
+/// Keychain. Throws when QA could not run at all (no tools, app failed to start, sign-in failed).
+public protocol PipelineQA: Sendable {
+    func runQA(
+        ticketID: String,
+        repository: RepositoryConfig,
+        onProgress: @escaping @Sendable (String) -> Void
+    ) async throws -> QASessionResult
+}
+
 /// After implementation: runs the repository's validation commands in the sandbox, lets the
 /// agent fix failures a bounded number of times, then has a fresh read-only agent review the
 /// result and hands the ticket to the user (`ready_for_human_review`).
@@ -10,6 +21,7 @@ public final class VerificationService: Sendable {
     private let implementation: ImplementationService
     private let validation: ValidationRunner
     private let artifacts: ArtifactStore
+    private let qa: (any PipelineQA)?
 
     public init(
         database: AppDatabase,
@@ -17,13 +29,16 @@ public final class VerificationService: Sendable {
         runner: any AgentRunner,
         implementation: ImplementationService,
         validationTimeout: Duration,
-        artifacts: ArtifactStore
+        artifacts: ArtifactStore,
+        buildGate: BuildGate? = nil,
+        qa: (any PipelineQA)? = nil
     ) {
+        self.qa = qa
         self.database = database
         self.worktrees = worktrees
         self.runner = runner
         self.implementation = implementation
-        self.validation = ValidationRunner(timeoutPerCommand: validationTimeout)
+        self.validation = ValidationRunner(timeoutPerCommand: validationTimeout, buildGate: buildGate)
         self.artifacts = artifacts
     }
 
@@ -43,19 +58,40 @@ public final class VerificationService: Sendable {
             try await database.transition(ticketID: ticketID, to: .validating, message: "Validation and review requested")
         }
         var result: ValidationResult?
+        var qaResult: QASessionResult?
         if try await database.state(of: ticketID) == .validating {
+            // QA follows passing tests when the repository asks for it.
+            let qa = repository.qa.runInPipeline ? self.qa : nil
             var attempt = 0
             while true {
-                let outcome = try await validate(ticketID: ticketID, repository: repository, tools: tools, attempt: attempt,
-                                                 isFinal: { $0.passed || attempt >= maxFixAttempts }, onEvent: onEvent)
-                result = outcome
-                if outcome.passed || attempt >= maxFixAttempts { break }
-                attempt += 1
-                onEvent(.progress("Validation failed. Automatic fix attempt \(attempt) of \(maxFixAttempts)"))
-                _ = try await implementation.implement(
-                    ticketID: ticketID, repository: repository, tools: tools,
-                    fixInstructions: Self.fixInstructions(for: outcome), onEvent: onEvent
+                let outcome = try await validate(
+                    ticketID: ticketID, repository: repository, tools: tools, attempt: attempt,
+                    isFinal: { $0.passed ? qa == nil : attempt >= maxFixAttempts }, onEvent: onEvent
                 )
+                result = outcome
+                if !outcome.passed {
+                    if attempt >= maxFixAttempts { break }
+                    attempt += 1
+                    onEvent(.progress("Validation failed. Automatic fix attempt \(attempt) of \(maxFixAttempts)"))
+                    _ = try await implementation.implement(
+                        ticketID: ticketID, repository: repository, tools: tools,
+                        fixInstructions: Self.fixInstructions(for: outcome), onEvent: onEvent
+                    )
+                    continue
+                }
+                guard let qa else { break }
+                qaResult = try await runQA(qa, ticketID: ticketID, repository: repository, onEvent: onEvent)
+                if let qaResult, qaResult.confirmedCount > 0, attempt < maxFixAttempts {
+                    attempt += 1
+                    onEvent(.progress("QA reproduced \(qaResult.confirmedCount) bug(s). Automatic fix attempt \(attempt) of \(maxFixAttempts)"))
+                    _ = try await implementation.implement(
+                        ticketID: ticketID, repository: repository, tools: tools,
+                        fixInstructions: Self.fixInstructions(forQA: qaResult), onEvent: onEvent
+                    )
+                    continue
+                }
+                try await database.transition(ticketID: ticketID, to: .reviewing, message: "Independent review started")
+                break
             }
         }
         let latest: ValidationResult
@@ -64,7 +100,61 @@ public final class VerificationService: Sendable {
         } else {
             latest = try await latestValidation(ticketID: ticketID)
         }
-        return try await review(ticketID: ticketID, validation: latest, onEvent: onEvent)
+        let qa = if let qaResult { qaResult } else { try await latestQA(ticketID: ticketID) }
+        return try await review(ticketID: ticketID, validation: latest, qa: qa, onEvent: onEvent)
+    }
+
+    /// The last QA session, if it tested the current implementation (none ran since).
+    private func latestQA(ticketID: String) async throws -> QASessionResult? {
+        let runs = try await database.runs(ticketID: ticketID)
+        guard let qa = runs.last(where: { $0.qa != nil }) else { return nil }
+        let lastImplementation = runs.last { $0.kind == .implementation }
+        return (lastImplementation.map { $0.id < qa.id } ?? true) ? qa.qa : nil
+    }
+
+    /// Runs and records the pipeline QA session. QA that cannot run (tools missing, the app does
+    /// not start, sign-in fails) is recorded as failed and the pipeline goes on to the review:
+    /// it never blocks the hand-off. Cancelling still stops everything.
+    private func runQA(
+        _ qa: any PipelineQA, ticketID: String, repository: RepositoryConfig, onEvent: @escaping @Sendable (RunEvent) -> Void
+    ) async throws -> QASessionResult? {
+        let runID = try await database.beginVerificationRun(
+            .qa, ticketID: ticketID, in: .validating, logPath: artifacts.directory(for: ticketID).appending(path: "qa").path
+        )
+        onEvent(.started)
+        do {
+            let result = try await qa.runQA(ticketID: ticketID, repository: repository) { onEvent(.progress($0)) }
+            try await database.completeQA(runID: runID, ticketID: ticketID, result: result)
+            return result
+        } catch is CancellationError {
+            await record(CancellationError(), runID: runID, ticketID: ticketID)
+            throw CancellationError()
+        } catch {
+            onEvent(.progress("QA could not run, continuing to the review: \(error.localizedDescription)"))
+            await record(error, runID: runID, ticketID: ticketID)
+            return nil
+        }
+    }
+
+    /// Instructions for the implementer when the QA session reproduced bugs.
+    public static func fixInstructions(forQA result: QASessionResult) -> String {
+        let confirmed = zip(result.report.findings, result.replays).filter { $0.1.status == .confirmed }.map(\.0)
+        return "DevPilot's QA session found these bugs in the running app and reproduced each one in a fresh browser. "
+            + "Fix their cause; do not special-case the test steps:\n"
+            + confirmed.map { finding in
+                var lines = [
+                    "- \(finding.title) (\(finding.severity.rawValue), page \(finding.pageURL))",
+                    "  Expected: \(finding.expected)",
+                    "  Actual: \(finding.actual)",
+                ]
+                if !finding.steps.isEmpty {
+                    lines.append("  Steps: " + finding.steps.joined(separator: " → "))
+                }
+                if !finding.evidence.isEmpty {
+                    lines.append("  Evidence: " + String(finding.evidence.prefix(1_500)).replacingOccurrences(of: "\n", with: "\n    "))
+                }
+                return lines.joined(separator: "\n")
+            }.joined(separator: "\n")
     }
 
     /// Instructions for the implementer when validation commands fail.
@@ -99,6 +189,9 @@ public final class VerificationService: Sendable {
                 tools: tools,
                 logDirectory: logDirectory,
                 fixAttempt: attempt,
+                environment: ValidationRunner.changeEnvironment(
+                    baseCommit: workspace.baseCommit, changedFiles: (try? await worktrees.changedFiles(in: workspace.worktreePath, since: workspace.baseCommit)) ?? []
+                ),
                 onProgress: { onEvent(.progress($0)) },
                 onLaunch: { [database] group in Task { try? await database.recordProcessGroup(runID: runID, processGroup: group) } }
             )
@@ -110,7 +203,9 @@ public final class VerificationService: Sendable {
         }
     }
 
-    private func review(ticketID: String, validation: ValidationResult, onEvent: @escaping @Sendable (RunEvent) -> Void) async throws -> ReviewReport {
+    private func review(
+        ticketID: String, validation: ValidationResult, qa: QASessionResult?, onEvent: @escaping @Sendable (RunEvent) -> Void
+    ) async throws -> ReviewReport {
         guard let ticket = try await database.ticket(id: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
         guard let plan = try await database.latestDecisionDocument(ticketID: ticketID) else {
             throw WorkflowError.implementationBlocked(.missingPlan)
@@ -125,6 +220,7 @@ public final class VerificationService: Sendable {
                 ticket: ticket, workspace: workspace, plan: plan,
                 implementation: try await database.runs(ticketID: ticketID).last { $0.implementation != nil }?.implementation?.report,
                 validation: validation,
+                qa: qa,
                 diff: try await worktrees.unifiedDiff(in: workspace.worktreePath, against: workspace.baseCommit),
                 commonGitDirectory: try await worktrees.commonGitDirectory(of: workspace.worktreePath),
                 logURL: logURL,

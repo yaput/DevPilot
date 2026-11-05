@@ -25,12 +25,30 @@ public enum WorkspaceError: Error, Equatable, LocalizedError {
     }
 }
 
+public enum CommitError: Error, Equatable, LocalizedError {
+    case emptyMessage
+    case nothingToCommit
+    case wrongBranch(expected: String, actual: String)
+    case failed(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .emptyMessage: "Write a commit message first."
+        case .nothingToCommit: "There is nothing to commit: the worktree has no changes."
+        case .wrongBranch(let expected, let actual):
+            "The worktree is on \(actual.isEmpty ? "a detached HEAD" : actual), not \(expected). Nothing was committed."
+        case .failed(let output): "git commit failed (a commit hook may have stopped it):\n\(output)"
+        }
+    }
+}
+
 public struct RepositoryInspection: Sendable, Equatable {
     public let topLevel: String
     public let defaultBranch: String?
 }
 
-/// Creates one isolated worktree and branch per ticket. Never commits, pushes or fetches.
+/// Creates one isolated worktree and branch per ticket. Never pushes or fetches, and commits
+/// only when the user clicks Commit (`commitAll`).
 public struct GitWorktreeManager: Sendable {
     public static let defaultGit = URL(filePath: "/usr/bin/git")
 
@@ -198,6 +216,105 @@ public struct GitWorktreeManager: Sendable {
             trimming: false
         )
         return Self.parseStatus(output)
+    }
+
+    /// Everything that differs from `base`: committed on the branch, uncommitted, or untracked.
+    /// Unlike `changedFiles(in:)`, work the user already committed still counts.
+    public func changedFiles(in worktree: String, since base: String) async throws -> [ChangedFile] {
+        let directory = URL(filePath: worktree, directoryHint: .isDirectory)
+        let diff = try await run(["-c", "core.quotepath=false", "diff", "--name-status", "-z", "-M", base, "--"], in: directory, trimming: false)
+        let untracked = try await run(["ls-files", "--others", "--exclude-standard", "-z"], in: directory, trimming: false)
+        return Self.parseNameStatus(diff)
+            + untracked.split(separator: "\0").map { ChangedFile(path: String($0), change: .untracked) }
+    }
+
+    static func parseNameStatus(_ output: String) -> [ChangedFile] {
+        var files: [ChangedFile] = []
+        var entries = output.split(separator: "\0", omittingEmptySubsequences: true).map(String.init)[...]
+        while let code = entries.popFirst(), let first = entries.popFirst() {
+            switch code.first {
+            case "R", "C":
+                // "R100\0old\0new": the new path is the file now.
+                guard let path = entries.popFirst() else { return files }
+                files.append(ChangedFile(path: path, change: .renamed))
+            case "A": files.append(ChangedFile(path: first, change: .added))
+            case "D": files.append(ChangedFile(path: first, change: .deleted))
+            case "M", "T": files.append(ChangedFile(path: first, change: .modified))
+            default: files.append(ChangedFile(path: first, change: .other))
+            }
+        }
+        return files
+    }
+
+    // MARK: - Committing
+
+    /// Stages everything in the worktree (new and deleted files too, `excluding` left out) and
+    /// commits it on the ticket's branch with the user's own git identity and config. Hooks run
+    /// as they would in Terminal, with `tools` on PATH, unless `skippingHooks`. The only git
+    /// write DevPilot makes, and only when the user asks. Returns the new commit's short hash.
+    public func commitAll(
+        _ workspace: TicketWorkspace, message: String, excluding: [String] = [], tools: ToolEnvironment,
+        skippingHooks: Bool = false
+    ) async throws -> String {
+        let directory = URL(filePath: workspace.worktreePath, directoryHint: .isDirectory)
+        let message = Self.ownMessage(message)
+        guard !message.isEmpty else { throw CommitError.emptyMessage }
+        // Never onto some other branch someone checked out in the worktree.
+        let current = try await run(["branch", "--show-current"], in: directory)
+        guard current == workspace.branch else { throw CommitError.wrongBranch(expected: workspace.branch, actual: current) }
+
+        try await run(["add", "--all", "--", "."] + excluding.map { ":(exclude,literal)\($0)" }, in: directory)
+        let staged = try await ProcessRunner.run(ProcessRequest(
+            executable: git, arguments: ["diff", "--cached", "--quiet"], workingDirectory: directory,
+            environment: Self.environment(), timeout: .seconds(60)
+        ))
+        guard staged.termination == .exited(1) else { throw CommitError.nothingToCommit }
+
+        let result = try await ProcessRunner.run(ProcessRequest(
+            executable: git, arguments: ["commit", "--quiet", "--file", "-"] + (skippingHooks ? ["--no-verify"] : []),
+            workingDirectory: directory, environment: Self.commitEnvironment(tools: tools),
+            stdin: Data(message.utf8), timeout: .seconds(600)
+        ))
+        guard result.succeeded else {
+            let output = (result.stderrText + "\n" + result.stdoutText).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw CommitError.failed(output.isEmpty ? "exit \(result.termination)" : String(output.suffix(1_500)))
+        }
+        // A commit-msg hook or template may have added co-authors; the commit is the user's alone.
+        let written = try await run(["log", "-1", "--format=%B"], in: directory)
+        if Self.ownMessage(written) != written.trimmingCharacters(in: .whitespacesAndNewlines) {
+            _ = try await ProcessRunner.run(ProcessRequest(
+                executable: git, arguments: ["commit", "--amend", "--quiet", "--no-verify", "--file", "-"],
+                workingDirectory: directory, environment: Self.commitEnvironment(tools: tools),
+                stdin: Data(Self.ownMessage(written).utf8), timeout: .seconds(60)
+            ))
+        }
+        return try await run(["rev-parse", "--short", "HEAD"], in: directory)
+    }
+
+    /// The message without co-author trailers (Claude's or anyone's) or "Generated with Claude
+    /// Code" lines: commits from DevPilot are authored by the user only.
+    static func ownMessage(_ message: String) -> String {
+        message.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { line in
+                let text = line.trimmingCharacters(in: .whitespaces).lowercased()
+                return !text.hasPrefix("co-authored-by:") && !(text.contains("generated with") && text.contains("claude"))
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// What a commit hook expects from Terminal: the user's tools on PATH, and the SSH agent
+    /// for signed commits. No CI flag, so hooks behave as they do for the user.
+    static func commitEnvironment(tools: ToolEnvironment) -> [String: String] {
+        var variables = environment()
+        var path = tools.variables(base: [:])
+        variables["PATH"] = path.removeValue(forKey: "PATH")
+        if let javaHome = path["JAVA_HOME"] { variables["JAVA_HOME"] = javaHome }
+        let inherited = ProcessInfo.processInfo.environment
+        for key in ["SSH_AUTH_SOCK", "USER", "LOGNAME"] {
+            if let value = inherited[key] { variables[key] = value }
+        }
+        return variables
     }
 
     static func parseStatus(_ output: String) -> [ChangedFile] {

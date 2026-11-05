@@ -5,6 +5,10 @@ public struct ProviderSettings: Codable, Sendable, Equatable {
     public var useSampleData = false
     public var shortcut = ShortcutSettings()
     public var jira = JiraSettings()
+    /// Minutes between background syncs; 0 turns them off (Refresh still works).
+    public var syncIntervalMinutes = 15
+
+    public static let syncIntervalChoices = [0, 5, 15, 30]
 
     public init() {}
 }
@@ -38,6 +42,7 @@ extension ProviderSettings {
         useSampleData = try container.decodeIfPresent(Bool.self, forKey: .useSampleData) ?? useSampleData
         shortcut = try container.decodeIfPresent(ShortcutSettings.self, forKey: .shortcut) ?? shortcut
         jira = try container.decodeIfPresent(JiraSettings.self, forKey: .jira) ?? jira
+        syncIntervalMinutes = try container.decodeIfPresent(Int.self, forKey: .syncIntervalMinutes) ?? syncIntervalMinutes
     }
 }
 

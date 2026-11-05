@@ -267,6 +267,37 @@ struct SecretsSection: View {
 }
 
 /// How DevPilot signs in to the local run before QA sessions, plus its Playwright install.
+/// The repository's QA notes, carried from one QA session to the next.
+private struct QAMemoryRow: View {
+    @Environment(AppModel.self) private var model
+    let repositoryID: String
+    @State private var revision = 0
+
+    var body: some View {
+        let store = QAMemoryStore(artifacts: model.artifacts)
+        let memory = revision >= 0 ? store.read(repositoryID: repositoryID) : nil
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("QA notes")
+                Text(memory.map { "\($0.split(separator: "\n").count) lines, updated after each session" }
+                     ?? "None yet. Written after the first QA session.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if memory != nil {
+                Button("View") { NSWorkspace.shared.open(store.url(repositoryID: repositoryID)) }
+                Button("Forget", role: .destructive) {
+                    store.forget(repositoryID: repositoryID)
+                    revision += 1
+                }
+                .help("The next QA session starts without notes.")
+            }
+        }
+        .controlSize(.small)
+    }
+}
+
 private struct QASignInSection: View {
     @Environment(AppModel.self) private var model
     @Binding var repository: RepositoryConfig
@@ -278,6 +309,12 @@ private struct QASignInSection: View {
         Section {
             toolsRow
             Stepper("QA session time limit: \(repository.qa.timeLimitMinutes) min", value: $repository.qa.timeLimitMinutes, in: 5...60, step: 5)
+            Toggle("Run a QA session after tests pass, before the review", isOn: $repository.qa.runInPipeline)
+                .help("""
+                    DevPilot starts the app from the ticket's worktree, has the QA agent test it, and sends reproduced bugs to \
+                    the automatic fix loop. One app runs locally at a time, so tickets take turns.
+                    """)
+            QAMemoryRow(repositoryID: repository.id)
             Toggle("Sign in before QA sessions", isOn: login.isEnabled)
             ForEach(login.wrappedValue.secretNames, id: \.self) { name in
                 CredentialField(repositoryID: repository.id, name: name)

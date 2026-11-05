@@ -17,7 +17,10 @@ struct DevPilotApp: App {
             DashboardView()
                 .environment(model)
                 .frame(minWidth: 900, minHeight: 560)
-                .task { await model.start() }
+                .task {
+                    IsolatedCapture.install(model: model)
+                    await model.start()
+                }
         }
 
         WindowGroup("Changes", id: AppWindow.changes, for: String.self) { $ticketID in
@@ -38,8 +41,13 @@ struct DevPilotApp: App {
             MenuBarView()
                 .environment(model)
         } label: {
-            Image(systemName: model.pendingApprovalCount + model.readyForReviewCount > 0 ? "paperplane.circle.fill" : "paperplane")
+            let needsYou = model.tickets.filter { model.lane(of: $0.id) == .needsYou }.count
+            Image(systemName: needsYou > 0 ? "paperplane.circle.fill" : "paperplane")
+            if needsYou > 0 {
+                Text("\(needsYou)")
+            }
         }
+        .menuBarExtraStyle(.window)
     }
 }
 
