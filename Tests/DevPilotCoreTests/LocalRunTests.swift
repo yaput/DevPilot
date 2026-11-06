@@ -368,7 +368,7 @@ struct RubyPresetTests {
         }
         let presets = CommandPresets.detect(repositoryAt: root.path)
         #expect(presets.setup.map(\.command) == ["bundle install"])
-        #expect(presets.validation.map(\.command) == ["bundle exec rspec"])
+        #expect(presets.validation.map(\.command) == [CommandPresets.changedSpecsCommand])
         #expect(presets.agent.map(\.command).prefix(3) == ["bundle", "ruby", "bin/rails"])
     }
 }
@@ -419,7 +419,7 @@ struct EndToEndSuitePresetTests {
             try contents.write(to: url, atomically: true, encoding: .utf8)
         }
         let validation = CommandPresets.detect(repositoryAt: root.path).validation
-        #expect(validation.map(\.command) == ["bundle exec rspec", "cd e2e && npm run test"])
+        #expect(validation.map(\.command) == [CommandPresets.changedSpecsCommand, "cd e2e && npm run test"])
         #expect(validation.map(\.isEnabled) == [true, false])
     }
 }

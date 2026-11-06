@@ -28,13 +28,23 @@ public struct ValidationResult: Codable, Sendable, Hashable {
     public let commands: [ValidationCommandResult]
     /// 0 for the run after implementation, then 1, 2… after automatic fix attempts.
     public let fixAttempt: Int
+    /// Commands not run because the ticket changed nothing under their `onlyIfChanged` paths.
+    public let skipped: [String]
 
     public var passed: Bool { commands.allSatisfy(\.passed) }
     public var failed: [ValidationCommandResult] { commands.filter { !$0.passed } }
 
-    public init(commands: [ValidationCommandResult], fixAttempt: Int) {
+    public init(commands: [ValidationCommandResult], fixAttempt: Int, skipped: [String] = []) {
         self.commands = commands
         self.fixAttempt = fixAttempt
+        self.skipped = skipped
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        commands = try container.decode([ValidationCommandResult].self, forKey: .commands)
+        fixAttempt = try container.decode(Int.self, forKey: .fixAttempt)
+        skipped = try container.decodeIfPresent([String].self, forKey: .skipped) ?? []
     }
 }
 

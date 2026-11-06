@@ -26,13 +26,13 @@ enum ReviewPrompt {
         let diff = request.diff.count > maxDiffCharacters
             ? String(request.diff.prefix(maxDiffCharacters)) + "\n[diff truncated; run `git diff \(request.workspace.baseCommit.prefix(12))` for the rest]"
             : request.diff
-        let validation = request.validation.commands.isEmpty
+        let validation = request.validation.commands.isEmpty && request.validation.skipped.isEmpty
             ? "No validation commands are configured for this repository."
-            : request.validation.commands.map { result in
+            : (request.validation.commands.map { result in
                 let status = result.passed ? "PASSED" : result.timedOut ? "TIMED OUT" : "FAILED (exit \(result.exitCode.map(String.init) ?? "signal"))"
                 return "- `\(result.command)`: \(status)" + (result.passed ? "" : "\n  Last output:\n" + result.outputTail
                     .split(separator: "\n").suffix(25).map { "    " + $0 }.joined(separator: "\n"))
-            }.joined(separator: "\n")
+            } + request.validation.skipped.map { "- `\($0)`: SKIPPED (the change touches none of the files it checks)" }).joined(separator: "\n")
         let implementer = request.implementation.map { report in
             """
             Outcome: \(report.outcome.rawValue). \(report.summary)
@@ -140,7 +140,7 @@ public enum ReviewDocumentRenderer {
             "- Ticket: [\(ticket.externalID)](\(ticket.url.absoluteString))",
             "- Branch: `\(workspace.branch)` from `\(workspace.baseBranch)` at `\(workspace.baseCommit.prefix(12))`, plan v\(planVersion)",
             "- Verdict: **\(report.verdict == .approve ? "Approve" : "Changes requested")**",
-            "- Tests: " + (validation.commands.isEmpty ? "none configured" : validation.passed ? "all passed" : "\(validation.failed.count) failing"),
+            "- Tests: " + (validation.commands.isEmpty ? (validation.skipped.isEmpty ? "none configured" : "none affected") : validation.passed ? "all passed" : "\(validation.failed.count) failing"),
             "", "## Summary", "", report.summary, "", "## Findings", "",
         ]
         if report.findings.isEmpty { lines.append("_None._") }
@@ -151,9 +151,12 @@ public enum ReviewDocumentRenderer {
             if !finding.suggestion.isEmpty { lines.append("  Suggestion: \(finding.suggestion)") }
         }
         lines += ["", "## Validation", ""]
-        if validation.commands.isEmpty { lines.append("_No validation commands configured._") }
+        if validation.commands.isEmpty && validation.skipped.isEmpty { lines.append("_No validation commands configured._") }
         for result in validation.commands {
             lines.append("- \(result.passed ? "✅" : "❌") `\(result.command)` (\(Int(result.durationSeconds))s)")
+        }
+        for command in validation.skipped {
+            lines.append("- ➖ `\(command)` (skipped: not affected)")
         }
         lines += ["", "## Plan coverage", ""]
         lines += report.planCoverage.map { "- [\($0.status.rawValue)] \($0.step)\($0.note.isEmpty ? "" : ": \($0.note)")" }

@@ -143,6 +143,24 @@ public enum UnifiedDiffParser {
 extension GitWorktreeManager {
     static let maxUntrackedFilesInDiff = 300
 
+    /// The workspace with `baseCommit` moved to where the ticket's work starts now. After the
+    /// user rebases the branch onto a newer base branch (or merges it in), the recorded commit
+    /// is older, and diffing against it would count everyone else's changes as the ticket's.
+    /// The newest of the recorded commit and the branch's merge bases with the base branch,
+    /// local and on origin.
+    public func withCurrentBase(_ workspace: TicketWorkspace) async -> TicketWorkspace {
+        let repository = URL(filePath: workspace.repositoryPath, directoryHint: .isDirectory)
+        let head = "refs/heads/\(workspace.branch)"
+        guard var base = try? await output(["merge-base", head, workspace.baseCommit], in: repository) else { return workspace }
+        for ref in [workspace.baseBranch, "origin/\(workspace.baseBranch)"] {
+            guard let candidate = try? await output(["merge-base", head, ref], in: repository), candidate != base else { continue }
+            if (try? await output(["merge-base", "--is-ancestor", base, candidate], in: repository)) != nil {
+                base = candidate
+            }
+        }
+        return base == workspace.baseCommit ? workspace : workspace.with(baseCommit: base)
+    }
+
     /// Everything that differs from `base` in the worktree: committed and uncommitted changes to
     /// tracked files, plus new untracked files (ignored files excluded). Read-only.
     public func diff(in worktree: String, against base: String) async throws -> [FileDiff] {
@@ -182,7 +200,8 @@ extension GitWorktreeManager {
     public func branchStatus(_ workspace: TicketWorkspace) async -> BranchStatus? {
         let repository = URL(filePath: workspace.repositoryPath, directoryHint: .isDirectory)
         let local = "refs/heads/\(workspace.branch)"
-        guard let commits = try? await run(["rev-list", "--count", "\(workspace.baseCommit)..\(local)"], in: repository) else {
+        let base = await withCurrentBase(workspace).baseCommit
+        guard let commits = try? await run(["rev-list", "--count", "\(base)..\(local)"], in: repository) else {
             return nil
         }
         let remote = await remoteBranch(for: workspace.branch, in: repository)

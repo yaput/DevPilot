@@ -260,6 +260,59 @@ struct VerificationServiceTests {
         #expect(try await ticket.db.runs(ticketID: ticket.id).compactMap(\.validation).last?.passed == false)
     }
 
+    @Test func commandsForUntouchedPathsAreSkippedNotFailed() async throws {
+        let ticket = try await ImplementedTicket()
+        defer { ticket.fixture.repo.remove() }
+        let runner = FakeAgentRunner()
+        var repository = ticket.repository(["true"])
+        repository.validationCommands.append(CommandRule(command: "exit 1", onlyIfChanged: "frontend/"))
+
+        _ = try await ticket.verification(runner).verify(
+            ticketID: ticket.id, repository: repository, tools: ticket.tools, maxFixAttempts: 2
+        ) { _ in }
+
+        #expect(runner.implementations.isEmpty)
+        let validation = try #require(try await ticket.db.runs(ticketID: ticket.id).last { $0.validation != nil }?.validation)
+        #expect(validation.passed)
+        #expect(validation.commands.map(\.command) == ["true"])
+        #expect(validation.skipped == ["exit 1"])
+        #expect(try #require(runner.reviews.first).validation.skipped == ["exit 1"])
+    }
+
+    @Test func commandsForChangedPathsRun() async throws {
+        let ticket = try await ImplementedTicket()
+        defer { ticket.fixture.repo.remove() }
+        let frontend = ticket.fixture.worktree.appending(path: "frontend")
+        try FileManager.default.createDirectory(at: frontend, withIntermediateDirectories: true)
+        try "x\n".write(to: frontend.appending(path: "app.ts"), atomically: true, encoding: .utf8)
+        var repository = ticket.repository([])
+        repository.validationCommands = [CommandRule(command: "exit 1", onlyIfChanged: "frontend/")]
+
+        _ = try await ticket.verification(FakeAgentRunner()).verify(
+            ticketID: ticket.id, repository: repository, tools: ticket.tools, maxFixAttempts: 0
+        ) { _ in }
+
+        let validation = try #require(try await ticket.db.runs(ticketID: ticket.id).last { $0.validation != nil }?.validation)
+        #expect(!validation.passed && validation.skipped.isEmpty)
+    }
+
+    @Test func oldValidationResultsDecodeWithoutSkipped() throws {
+        let json = #"{"commands":[],"fixAttempt":1}"#
+        #expect(try JSONDecoder().decode(ValidationResult.self, from: Data(json.utf8)) == ValidationResult(commands: [], fixAttempt: 1))
+    }
+
+    @Test func testDatabaseNeedsAConnectionWithPassword() async throws {
+        var config = LocalRunConfig.Database()
+        config.isEnabled = true
+        config.user = "postgres"
+        await #expect(throws: ValidationDatabaseError.notConfigured) {
+            try await ValidationDatabase.create(ticketID: "t", config: config, adminPassword: nil, tools: ToolEnvironment(path: "", javaHome: ""))
+        }
+        let name = ValidationDatabase.name(ticketID: "shortcut:omakase/SC-2621 Fix it")
+        #expect(name.hasPrefix(ValidationDatabase.prefix) && name.count <= 63)
+        #expect(name.allSatisfy { $0.isASCII && ($0.isLowercase || $0.isNumber || $0 == "_") })
+    }
+
     @Test func noAutomaticFixWhenDisabled() async throws {
         let ticket = try await ImplementedTicket()
         defer { ticket.fixture.repo.remove() }

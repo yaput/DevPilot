@@ -415,10 +415,12 @@ public actor LocalEnvironment {
         GitWorktreeManager.slug(name, maxLength: 40)
     }
 
-    /// Runs `createdb`/`dropdb` from the build-tools PATH with the configured connection.
+    /// Runs `createdb`/`dropdb`/`psql` from the build-tools PATH with the configured connection.
+    /// Returns standard output.
+    @discardableResult
     static func postgres(
         _ tool: String, _ arguments: [String], config: LocalRunConfig.Database, password: String?, tools: ToolEnvironment
-    ) async throws {
+    ) async throws -> String {
         let path = tools.variables(base: [:])["PATH"] ?? ToolEnvironment.systemPath
         guard let executable = path.split(separator: ":").map({ "\($0)/\(tool)" }).first(where: FileManager.default.isExecutableFile(atPath:)) else {
             throw LocalRunError.toolMissing(tool)
@@ -436,6 +438,7 @@ public actor LocalEnvironment {
         guard result.succeeded else {
             throw LocalRunError.database(result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines))
         }
+        return result.stdoutText
     }
 
     /// Loopback addresses a dev server may listen on: Node and Vite bind "localhost" to ::1 only.

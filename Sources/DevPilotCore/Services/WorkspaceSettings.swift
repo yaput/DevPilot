@@ -8,12 +8,16 @@ public struct CommandRule: Codable, Sendable, Hashable, Identifiable {
     /// Setup only: a failure is logged as a warning and the run continues (e.g. installing a
     /// package the app does not need to run).
     public var isOptional: Bool
+    /// Validation only: space-separated path prefixes (e.g. `frontend/`). The command runs only
+    /// when the ticket changed a file under one of them; empty means always.
+    public var onlyIfChanged: String
 
-    public init(id: String = UUID().uuidString, command: String, isEnabled: Bool = true, isOptional: Bool = false) {
+    public init(id: String = UUID().uuidString, command: String, isEnabled: Bool = true, isOptional: Bool = false, onlyIfChanged: String = "") {
         self.id = id
         self.command = command
         self.isEnabled = isEnabled
         self.isOptional = isOptional
+        self.onlyIfChanged = onlyIfChanged
     }
 
     public init(from decoder: Decoder) throws {
@@ -22,6 +26,13 @@ public struct CommandRule: Codable, Sendable, Hashable, Identifiable {
         command = try container.decode(String.self, forKey: .command)
         isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
         isOptional = try container.decodeIfPresent(Bool.self, forKey: .isOptional) ?? false
+        onlyIfChanged = try container.decodeIfPresent(String.self, forKey: .onlyIfChanged) ?? ""
+    }
+
+    /// Whether the command should run for a ticket that changed these repository-relative paths.
+    public func applies(to changedPaths: [String]) -> Bool {
+        let prefixes = onlyIfChanged.split(whereSeparator: \.isWhitespace).map { $0.hasPrefix("./") ? String($0.dropFirst(2)) : String($0) }
+        return prefixes.isEmpty || changedPaths.contains { path in prefixes.contains { path.hasPrefix($0) } }
     }
 }
 
@@ -40,6 +51,12 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
     /// Full commands DevPilot runs (sandboxed) after implementation to verify the change, e.g.
     /// `cd services/ui && pnpm test`. Each must exit 0 to pass.
     public var validationCommands: [CommandRule]
+    /// Gives each validation run a throwaway Postgres database (`DATABASE_URL`), made through
+    /// the local run's database connection. See `ValidationDatabase`.
+    public var validationDatabase: Bool
+    /// `KEY=VALUE` lines set for every validation command, like CI's job environment
+    /// (e.g. `RAILS_LOG_LEVEL=error`).
+    public var validationEnvironment: String
     /// How to run the app locally for manual and QA testing.
     public var localRun: LocalRunConfig
     /// Signing in for QA sessions against the local run.
@@ -58,6 +75,8 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
         self.setupCommands = setupCommands
         self.agentCommands = agentCommands
         self.validationCommands = validationCommands
+        self.validationDatabase = false
+        self.validationEnvironment = ""
         self.localRun = LocalRunConfig()
         self.qa = QAConfig()
         self.autopilot = AutopilotConfig()
@@ -72,6 +91,8 @@ public struct RepositoryConfig: Codable, Sendable, Hashable, Identifiable {
         setupCommands = try container.decodeIfPresent([CommandRule].self, forKey: .setupCommands) ?? []
         agentCommands = try container.decodeIfPresent([CommandRule].self, forKey: .agentCommands) ?? []
         validationCommands = try container.decodeIfPresent([CommandRule].self, forKey: .validationCommands) ?? []
+        validationDatabase = try container.decodeIfPresent(Bool.self, forKey: .validationDatabase) ?? false
+        validationEnvironment = try container.decodeIfPresent(String.self, forKey: .validationEnvironment) ?? ""
         localRun = try container.decodeIfPresent(LocalRunConfig.self, forKey: .localRun) ?? LocalRunConfig()
         qa = try container.decodeIfPresent(QAConfig.self, forKey: .qa) ?? QAConfig()
         autopilot = try container.decodeIfPresent(AutopilotConfig.self, forKey: .autopilot) ?? AutopilotConfig()
@@ -163,7 +184,9 @@ public enum CommandPresets {
                 add("ruby")
                 if has("bin/rails") { add("bin/rails") }
                 if has(".rspec") || has("spec") {
-                    validation.append(cd + "bundle exec rspec")
+                    // At the top level, only the specs the ticket touched: the whole suite takes
+                    // minutes and CI runs it anyway.
+                    validation.append(project.isEmpty ? changedSpecsCommand : cd + "bundle exec rspec")
                 } else if has("test") && has("bin/rails") {
                     validation.append(cd + "bin/rails test")
                 }
@@ -199,8 +222,43 @@ public enum CommandPresets {
         return (
             setup.map { CommandRule(command: $0) },
             agent.map { CommandRule(command: $0) },
-            validation.map { CommandRule(command: $0, isEnabled: !needsRunningApp($0)) }
+            validation.map { CommandRule(command: $0, isEnabled: !needsRunningApp($0), onlyIfChanged: subProject(of: $0)) }
         )
+    }
+
+    /// RSpec on the spec files the ticket changed plus the spec of each changed `app/` or `lib/`
+    /// file (`app/models/customer.rb` → `spec/models/customer_spec.rb`). Passes when there are none.
+    public static let changedSpecsCommand = #"specs=$(printf '%s\n' "$DEVPILOT_CHANGED_FILES" | sed -nE -e 's#^app/(.*)\.rb$#spec/\1_spec.rb#p' -e 's#^lib/(.*)\.rb$#spec/lib/\1_spec.rb#p' -e '/^spec\/.*_spec\.rb$/p' | sort -u | while read -r f; do [ -f "$f" ] && echo "$f"; done); if [ -z "$specs" ]; then echo "No specs for the changed files."; else echo "Running the specs for the changed files:" $specs; bundle exec rspec $specs; fi"#
+
+    /// Variables from `KEY=VALUE` lines; blank lines and `#` comments are skipped.
+    public static func environment(fromLines text: String) -> [String: String] {
+        var variables: [String: String] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.hasPrefix("#"), let equals = trimmed.firstIndex(of: "=") else { continue }
+            let key = trimmed[..<equals].trimmingCharacters(in: .whitespaces)
+            guard !key.isEmpty else { continue }
+            variables[key] = String(trimmed[trimmed.index(after: equals)...])
+        }
+        return variables
+    }
+
+    /// Rails logs every SQL statement at debug level, which slows tests down; CI turns it off.
+    public static func validationEnvironment(for validation: [CommandRule]) -> String {
+        needsDatabase(validation) ? "RAILS_LOG_LEVEL=error" : ""
+    }
+
+    /// Rails test suites need a database; Java and JavaScript suites usually bring their own.
+    public static func needsDatabase(_ validation: [CommandRule]) -> Bool {
+        validation.contains { $0.isEnabled && ($0.command.contains("rspec") || $0.command.contains("rails test")) }
+    }
+
+    /// `frontend/` for `cd frontend && pnpm run test`: a sub-project's checks only matter when
+    /// the ticket changed it. Empty for commands that run at the top level.
+    public static func subProject(of command: String) -> String {
+        guard let match = command.firstMatch(of: #/^cd ([^\s&;|]+) && /#) else { return "" }
+        let directory = String(match.1)
+        return directory.hasSuffix("/") ? directory : directory + "/"
     }
 
     /// Script names declared in a package.json; empty if it can't be read.

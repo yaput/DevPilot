@@ -26,6 +26,13 @@ public struct TicketWorkspace: Codable, Sendable, Hashable {
         self.worktreePath = worktreePath
         self.createdAt = createdAt
     }
+
+    func with(baseCommit: String) -> TicketWorkspace {
+        TicketWorkspace(
+            ticketID: ticketID, repositoryID: repositoryID, repositoryName: repositoryName, repositoryPath: repositoryPath,
+            baseBranch: baseBranch, baseCommit: baseCommit, branch: branch, worktreePath: worktreePath, createdAt: createdAt
+        )
+    }
 }
 
 /// Structured result of a read-only investigation, produced by the agent against a JSON schema.

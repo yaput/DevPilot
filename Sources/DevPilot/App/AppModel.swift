@@ -178,7 +178,7 @@ final class AppModel {
         self.messages = message.map { [AppMessage(text: $0)] } ?? []
         services = Self.makeServices(
             database: orchestrator.database, workspace: workspaceSettings, agent: agentSettings, artifacts: artifacts,
-            buildGate: buildGate, pipelineQA: pipelineQA, usageRelay: usageRelay
+            buildGate: buildGate, pipelineQA: pipelineQA, usageRelay: usageRelay, credentials: credentials
         )
         // Child processes are in their own process groups, so they would outlive the app.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
@@ -256,6 +256,14 @@ final class AppModel {
         if !AppDatabase.isIsolated {
             await localEnvironment.cleanUpLeftovers(tools: agentSettings.toolEnvironment) { repositoryID, name in
                 (try? credentials.secret(for: .repository(repositoryID, name))) ?? nil
+            }
+            // Throwaway test databases of validations interrupted by a crash.
+            for repository in workspaceSettings.repositories where repository.validationDatabase {
+                let database = repository.localRun.database
+                await ValidationDatabase.cleanUpLeftovers(
+                    config: database, adminPassword: (try? credentials.secret(for: .repository(repository.id, database.passwordSecret))) ?? nil,
+                    tools: agentSettings.toolEnvironment
+                )
             }
         }
         Notifier.shared.requestAuthorization()
@@ -537,7 +545,8 @@ final class AppModel {
             default: return "Stop the local run first: it copies files such as .env into the worktree."
             }
         }
-        if qaSession?.ticketID == ticketID { return "Wait for the QA session to finish." }
+        // A finished session stays in `qaSession` for its results; only a running one blocks.
+        if let qaSession, qaSession.ticketID == ticketID, qaSession.isRunning { return "Wait for the QA session to finish." }
         return nil
     }
 
@@ -735,9 +744,9 @@ final class AppModel {
         guard FileManager.default.fileExists(atPath: workspace.worktreePath) else {
             throw ImplementationError.worktreeMissing(workspace.worktreePath)
         }
-        let files = try await GitWorktreeManager(worktreeRoot: workspaceSettings.resolvedWorktreeRoot)
-            .diff(in: workspace.worktreePath, against: workspace.baseCommit)
-        return (workspace, files)
+        let worktrees = GitWorktreeManager(worktreeRoot: workspaceSettings.resolvedWorktreeRoot)
+        let current = await worktrees.withCurrentBase(workspace)
+        return (current, try await worktrees.diff(in: current.worktreePath, against: current.baseCommit))
     }
 
     // MARK: - Settings
@@ -980,7 +989,12 @@ final class AppModel {
         isFetchingUsage = true
         defer { isFetchingUsage = false }
         do {
-            recordUsage(try await ClaudeCLI.fetchUsage(executable: executable))
+            // Not tied to the view that asked: it disappears during launch (or when the user
+            // navigates), which would cancel a reading already under way.
+            let usage = try await Task { try await ClaudeCLI.fetchUsage(executable: executable) }.value
+            recordUsage(usage)
+        } catch is CancellationError {
+            // Not a failure; the next refresh tries again.
         } catch {
             usageError = error.localizedDescription
         }
@@ -1364,7 +1378,7 @@ final class AppModel {
     private func rebuildServices() {
         services = Self.makeServices(
             database: orchestrator.database, workspace: workspaceSettings, agent: agentSettings, artifacts: artifacts,
-            buildGate: buildGate, pipelineQA: pipelineQA, usageRelay: usageRelay
+            buildGate: buildGate, pipelineQA: pipelineQA, usageRelay: usageRelay, credentials: credentials
         )
     }
 
@@ -1496,6 +1510,38 @@ final class AppModel {
             settings.presetsVersion = 6
             changed = true
         }
+        if settings.presetsVersion < 7 {
+            for index in settings.repositories.indices {
+                var repository = settings.repositories[index]
+                // A sub-project's checks only run when the ticket changed it.
+                for rule in repository.validationCommands.indices where repository.validationCommands[rule].onlyIfChanged.isEmpty {
+                    repository.validationCommands[rule].onlyIfChanged = CommandPresets.subProject(of: repository.validationCommands[rule].command)
+                }
+                // Test suites that need a database get a throwaway one when a connection is set up.
+                repository.validationDatabase = repository.localRun.database.isEnabled && CommandPresets.needsDatabase(repository.validationCommands)
+                settings.repositories[index] = repository
+            }
+            settings.presetsVersion = 7
+            changed = true
+        }
+        if settings.presetsVersion < 8 {
+            // The whole suite takes minutes per run; test what the ticket changed (CI runs the rest).
+            for index in settings.repositories.indices {
+                for rule in settings.repositories[index].validationCommands.indices
+                    where settings.repositories[index].validationCommands[rule].command == "bundle exec rspec" {
+                    settings.repositories[index].validationCommands[rule].command = CommandPresets.changedSpecsCommand
+                }
+            }
+            settings.presetsVersion = 8
+            changed = true
+        }
+        if settings.presetsVersion < 9 {
+            for index in settings.repositories.indices where settings.repositories[index].validationEnvironment.isEmpty {
+                settings.repositories[index].validationEnvironment = CommandPresets.validationEnvironment(for: settings.repositories[index].validationCommands)
+            }
+            settings.presetsVersion = 9
+            changed = true
+        }
         return changed
     }
 
@@ -1526,7 +1572,8 @@ final class AppModel {
         artifacts: ArtifactStore,
         buildGate: BuildGate,
         pipelineQA: any PipelineQA,
-        usageRelay: UsageRelay
+        usageRelay: UsageRelay,
+        credentials: any CredentialStore
     ) -> Services {
         let runner: any AgentRunner = if let executable = ClaudeCLI.resolve(configuredPath: agent.claudePath) {
             ClaudeCodeRunner(
@@ -1549,7 +1596,8 @@ final class AppModel {
             verification: VerificationService(
                 database: database, worktrees: worktrees, runner: runner, implementation: implementation,
                 validationTimeout: .seconds(max(1, agent.validationTimeoutMinutes) * 60), artifacts: artifacts,
-                buildGate: buildGate, qa: pipelineQA
+                buildGate: buildGate, qa: pipelineQA,
+                secret: { repositoryID, name in (try? credentials.secret(for: .repository(repositoryID, name))) ?? nil }
             ),
             qa: qa
         )

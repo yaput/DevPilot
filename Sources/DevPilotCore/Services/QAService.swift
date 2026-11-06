@@ -43,9 +43,10 @@ public final class QAService: Sendable {
         guard qaTools.isInstalled else { throw LoginError.toolsNotInstalled }
         guard let appURL = localRun.appURL else { throw LocalRunError.notConfigured }
         guard let ticket = try await database.ticket(id: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
-        guard let workspace = try await database.workspace(ticketID: ticketID) else {
+        guard let recorded = try await database.workspace(ticketID: ticketID) else {
             throw ImplementationError.worktreeMissing("the ticket's worktree")
         }
+        let workspace = await worktrees.withCurrentBase(recorded)
         let startedAt = Date()
         let session = Self.sessionDirectory(artifacts.directory(for: ticketID), startedAt: startedAt)
         try FileManager.default.createDirectory(at: session.appending(path: "browser"), withIntermediateDirectories: true)

@@ -424,6 +424,49 @@ struct CommandPresetTests {
             "cd services/ui && pnpm install --frozen-lockfile",
         ])
         #expect(presets.agent.map(\.command) == ["cd", "./gradlew", "java", "pnpm", "npx", "node"] + CommandPresets.gitInspection + CommandPresets.shellUtilities)
+        #expect(presets.validation.map(\.onlyIfChanged) == ["services/core/", "services/ui/", "services/ui/"])
+    }
+
+    @Test func changedSpecsCommandRunsOnlyTheSpecsTheTicketTouched() async throws {
+        let url = try directory([])
+        defer { try? FileManager.default.removeItem(at: url) }
+        for file in ["spec/models/customer_spec.rb", "spec/services/resolver_spec.rb", "spec/lib/tools/x_spec.rb", "spec/models/other_spec.rb", "bin/bundle"] {
+            let path = url.appending(path: file)
+            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: path.path, contents: Data())
+        }
+        // Stands in for Bundler: records what rspec would have been given.
+        try "#!/bin/sh\necho \"$@\" > ran.txt\n".write(to: url.appending(path: "bin/bundle"), atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.appending(path: "bin/bundle").path)
+
+        func run(_ changed: [String]) async throws -> String? {
+            try? FileManager.default.removeItem(at: url.appending(path: "ran.txt"))
+            let result = try await ProcessRunner.run(ProcessRequest(
+                executable: URL(filePath: "/bin/sh"), arguments: ["-c", CommandPresets.changedSpecsCommand], workingDirectory: url,
+                environment: ["PATH": url.appending(path: "bin").path + ":/usr/bin:/bin", "DEVPILOT_CHANGED_FILES": changed.joined(separator: "\n")],
+                timeout: .seconds(10)
+            ))
+            #expect(result.succeeded)
+            return try? String(contentsOf: url.appending(path: "ran.txt"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let ran = try await run(["app/models/customer.rb", "spec/services/resolver_spec.rb", "lib/tools/x.rb", "app/models/no_spec_yet.rb", "db/structure.sql"])
+        #expect(ran == "exec rspec spec/lib/tools/x_spec.rb spec/models/customer_spec.rb spec/services/resolver_spec.rb")
+        #expect(try await run(["frontend/src/a.ts", "README.md"]) == nil)
+        #expect(try await run([]) == nil)
+    }
+
+    @Test func onlyIfChangedMatchesPathPrefixes() {
+        let rule = CommandRule(command: "pnpm test", onlyIfChanged: "frontend/  ./shared/")
+        #expect(rule.applies(to: ["frontend/src/a.ts"]))
+        #expect(rule.applies(to: ["app/x.rb", "shared/y.ts"]))
+        #expect(!rule.applies(to: ["app/models/customer.rb", "spec/customer_spec.rb"]))
+        #expect(!rule.applies(to: []))
+        #expect(CommandRule(command: "bundle exec rspec").applies(to: []))
+        #expect(CommandPresets.subProject(of: "cd frontend && pnpm run lint") == "frontend/")
+        #expect(CommandPresets.subProject(of: "bundle exec rspec").isEmpty)
+        #expect(CommandPresets.needsDatabase([CommandRule(command: "bundle exec rspec")]))
+        #expect(!CommandPresets.needsDatabase([CommandRule(command: "bundle exec rspec", isEnabled: false), CommandRule(command: "pnpm test")]))
     }
 
     @Test func oldRepositorySettingsDecodeWithoutCommands() throws {

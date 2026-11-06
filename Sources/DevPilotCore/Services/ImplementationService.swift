@@ -59,9 +59,10 @@ public final class ImplementationService: Sendable {
         onEvent: @escaping @Sendable (RunEvent) -> Void
     ) async throws -> ImplementationResult {
         guard let ticket = try await database.ticket(id: ticketID) else { throw WorkflowError.unknownTicket(ticketID) }
-        guard let workspace = try await database.workspace(ticketID: ticketID) else {
+        guard let recorded = try await database.workspace(ticketID: ticketID) else {
             throw ImplementationError.worktreeMissing("no worktree recorded")
         }
+        let workspace = await worktrees.withCurrentBase(recorded)
         guard FileManager.default.fileExists(atPath: workspace.worktreePath) else {
             throw ImplementationError.worktreeMissing(workspace.worktreePath)
         }

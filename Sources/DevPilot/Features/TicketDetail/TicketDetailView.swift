@@ -35,6 +35,8 @@ struct TicketDetailView: View {
                 WorkflowPanel(ticket: ticket, state: state, detail: detail) { reviewingPlan = $0 }
                 if let workspace = detail.workspace, FileManager.default.fileExists(atPath: workspace.worktreePath) {
                     WorkspaceBar(ticket: ticket, workspace: workspace, hasImplementation: detail.latestImplementation != nil)
+                        // Fresh state per ticket: the detail view is reused when the selection changes.
+                        .id(ticket.id)
                     TryLocallyCard(ticket: ticket, workspace: workspace)
                 }
                 tabs
@@ -797,9 +799,18 @@ private struct WorkspaceBar: View {
                     Text(model.workspaceSettings.repository(id: workspace.repositoryID)?.name ?? "Worktree")
                         .font(.callout.weight(.semibold))
                     if hasImplementation, let status {
-                        Text(summary(status))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        if (status.uncommittedFiles ?? 0) > 0, let blocker = model.commitBlocker(ticket.id) {
+                            // Why Commit is disabled, where it can be seen without hovering.
+                            Text(blocker)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        } else {
+                            Text(summary(status))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
                 Text("\(workspace.branch) ← \(workspace.baseBranch) @ \(workspace.baseCommit.prefix(8))")
@@ -837,7 +848,7 @@ private struct WorkspaceBar: View {
         }
         .controlSize(.small)
         .card(padding: 12)
-        .task(id: "\(model.detailRevision)|\(model.isRunning(ticket.id))|\(model.state(of: ticket.id))") { await loadStatus() }
+        .task(id: "\(ticket.id)|\(model.detailRevision)|\(model.isRunning(ticket.id))|\(model.state(of: ticket.id))") { await loadStatus() }
         // Back from the editor or Terminal: the worktree may have changed.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await loadStatus() }

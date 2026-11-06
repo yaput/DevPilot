@@ -17,6 +17,15 @@ struct ChangesView: View {
         NavigationSplitView {
             List(files, selection: $selection) { file in
                 FileRow(file: file)
+                    .contextMenu {
+                        if let workspace, file.change != .deleted {
+                            let url = URL(filePath: workspace.worktreePath).appending(path: file.id)
+                            if let editor = model.preferredEditor {
+                                Button("Open in \(editor.name)") { editor.open(url) }
+                            }
+                            OtherEditorsMenuItems(file: url)
+                        }
+                    }
             }
             .overlay {
                 if files.isEmpty && !isLoading {
@@ -256,6 +265,7 @@ private struct DiffLineRow: View {
 }
 
 /// "Open in IntelliJ IDEA" for the worktree, with each sub-project of a monorepo as an option.
+/// Clicking opens the preferred editor; the menu also offers the other installed editors.
 struct OpenWorktreeMenu: View {
     @Environment(AppModel.self) private var model
     let workspace: TicketWorkspace
@@ -264,19 +274,55 @@ struct OpenWorktreeMenu: View {
         if let editor = model.preferredEditor {
             let root = URL(filePath: workspace.worktreePath, directoryHint: .isDirectory)
             let projects = CommandPresets.projectDirectories(in: root).filter { !$0.isEmpty }
-            if projects.isEmpty {
-                Button { editor.open(root) } label: { Label("Open in \(editor.name)", systemImage: "chevron.left.forwardslash.chevron.right") }
+            let others = model.editors.filter { $0 != editor }
+            let label = Label("Open in \(editor.name)", systemImage: "chevron.left.forwardslash.chevron.right")
+            if projects.isEmpty && others.isEmpty {
+                Button { editor.open(root) } label: { label }
             } else {
                 Menu {
-                    Button("Whole repository") { editor.open(root) }
-                    Divider()
-                    ForEach(projects, id: \.self) { project in
-                        Button(project) { editor.open(root.appending(path: project, directoryHint: .isDirectory)) }
+                    if projects.isEmpty {
+                        Button("Open in \(editor.name)") { editor.open(root) }
+                    } else {
+                        targets(editor, root: root, projects: projects)
+                    }
+                    if !others.isEmpty {
+                        Divider()
+                        ForEach(others) { other in
+                            if projects.isEmpty {
+                                Button("Open in \(other.name)") { other.open(root) }
+                            } else {
+                                Menu("Open in \(other.name)") { targets(other, root: root, projects: projects) }
+                            }
+                        }
                     }
                 } label: {
-                    Label("Open in \(editor.name)", systemImage: "chevron.left.forwardslash.chevron.right")
+                    label
+                } primaryAction: {
+                    editor.open(root)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func targets(_ editor: EditorApp, root: URL, projects: [String]) -> some View {
+        Button("Whole repository") { editor.open(root) }
+        Divider()
+        ForEach(projects, id: \.self) { project in
+            Button(project) { editor.open(root.appending(path: project, directoryHint: .isDirectory)) }
+        }
+    }
+}
+
+/// Context-menu items to open a file in each installed editor other than the preferred one.
+struct OtherEditorsMenuItems: View {
+    @Environment(AppModel.self) private var model
+    let file: URL
+    var line = 0
+
+    var body: some View {
+        ForEach(model.editors.filter { $0 != model.preferredEditor }) { editor in
+            Button("Open in \(editor.name)") { editor.open(file, line: line) }
         }
     }
 }

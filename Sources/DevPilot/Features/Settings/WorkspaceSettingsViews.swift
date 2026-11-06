@@ -161,6 +161,8 @@ struct RepositoriesSettingsView: View {
                 )
                 let (localRun, secrets) = LocalRunPresets.detect(repositoryAt: inspection.topLevel)
                 repository.localRun = localRun
+                repository.validationDatabase = localRun.database.isEnabled && CommandPresets.needsDatabase(presets.validation)
+                repository.validationEnvironment = CommandPresets.validationEnvironment(for: presets.validation)
                 repository.qa.login = LoginPresets.detect(repositoryAt: inspection.topLevel)
                 for (name, value) in secrets {
                     model.setRepositorySecret(repository.id, name, value: value)
@@ -376,11 +378,18 @@ private struct RepositoryCommandsSheet: View {
                     Text("Run by DevPilot in a fresh worktree before Claude starts, with network access, in this order. Use them to install dependencies.")
                 }
                 Section {
-                    CommandList(rules: $repository.validationCommands, placeholder: "e.g. cd services/ui && pnpm run test")
+                    CommandList(rules: $repository.validationCommands, placeholder: "e.g. cd services/ui && pnpm run test", allowsPathFilter: true)
+                    Toggle("Give tests a throwaway Postgres database", isOn: $repository.validationDatabase)
+                        .disabled(!repository.localRun.database.isEnabled && !repository.validationDatabase)
+                        .help(repository.localRun.database.isEnabled ? "" : "Set up the database connection under Local Run first.")
+                    TextField("Environment", text: $repository.validationEnvironment, prompt: Text("KEY=VALUE, one per line"), axis: .vertical)
+                        .font(.callout.monospaced())
+                        .lineLimit(2...6)
+                        .help("Set for every validation command, like CI's job environment, e.g. RAILS_LOG_LEVEL=error.")
                 } header: {
                     Text("Validation commands")
                 } footer: {
-                    Text("Run by DevPilot after every implementation and fix, in the sandbox (no network, writes only in the worktree and build caches). Each must exit 0. Results go to the reviewer and to you. $DEVPILOT_CHANGED_FILES lists the files the ticket changed (one per line) and $DEVPILOT_BASE_COMMIT its starting commit, to test only what changed, e.g. pnpm vitest related --run $DEVPILOT_CHANGED_FILES.")
+                    Text("Run by DevPilot after every implementation and fix, in the sandbox (no network, writes only in the worktree and build caches). Each must exit 0. Results go to the reviewer and to you. \"Only if changed\" takes path prefixes (e.g. frontend/): the command is skipped when the ticket changed nothing under them. $DEVPILOT_CHANGED_FILES lists the files the ticket changed (one per line) and $DEVPILOT_BASE_COMMIT its starting commit, to test only what changed, e.g. pnpm vitest related --run $DEVPILOT_CHANGED_FILES. The test database is created for each run through the Local Run connection, owned by a one-off role (the tests never see your credentials), passed as DATABASE_URL and PG* variables, and dropped afterwards.")
                 }
                 Section {
                     CommandList(rules: $repository.agentCommands, placeholder: "e.g. ./mvnw or pnpm")
@@ -432,6 +441,8 @@ private struct CommandList: View {
     let placeholder: String
     /// Setup commands can be optional: a failure is a warning, not a stop.
     var allowsOptional = false
+    /// Validation commands can be limited to tickets that change certain paths.
+    var allowsPathFilter = false
 
     var body: some View {
         if rules.isEmpty {
@@ -444,6 +455,13 @@ private struct CommandList: View {
                     .font(.callout.monospaced())
                     .labelsHidden()
                     .foregroundStyle(rule.isEnabled ? .primary : .secondary)
+                if allowsPathFilter {
+                    TextField("Only if changed", text: $rule.onlyIfChanged, prompt: Text("any change"))
+                        .font(.callout.monospaced())
+                        .labelsHidden()
+                        .frame(width: 110)
+                        .help("Only if changed: run this command only when the ticket changed a file under one of these space-separated paths, e.g. frontend/. Empty: always.")
+                }
                 if allowsOptional {
                     Toggle("Optional", isOn: $rule.isOptional)
                         .toggleStyle(.checkbox)

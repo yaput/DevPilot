@@ -22,7 +22,7 @@ struct HandoffPanel: View {
             HStack(spacing: 8) {
                 if let validation {
                     ResultChip(
-                        text: validation.commands.isEmpty ? "No tests configured"
+                        text: validation.commands.isEmpty ? (validation.skipped.isEmpty ? "No tests configured" : "No affected tests")
                             : validation.passed ? "Tests passed" : "\(validation.failed.count) of \(validation.commands.count) checks failing",
                         systemImage: validation.passed ? "checkmark.circle.fill" : "xmark.circle.fill",
                         tint: validation.commands.isEmpty ? .secondary : validation.passed ? .green : .red
@@ -104,7 +104,7 @@ struct VerificationSection: View {
                         }
                     }
                     .padding(.bottom, 4)
-                    if validation.commands.isEmpty {
+                    if validation.commands.isEmpty && validation.skipped.isEmpty {
                         Text("No validation commands are configured for this repository.").foregroundStyle(.secondary)
                     }
                     ForEach(validation.commands, id: \.self) { result in
@@ -127,6 +127,16 @@ struct VerificationSection: View {
                                     .controlSize(.mini)
                             }
                         }
+                    }
+                    ForEach(validation.skipped, id: \.self) { command in
+                        HStack {
+                            Image(systemName: "minus.circle").foregroundStyle(.secondary)
+                            Text(command).font(.callout.monospaced()).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
+                            Spacer()
+                            Text("skipped · not affected").font(.caption).foregroundStyle(.secondary)
+                        }
+                        .help("The ticket changed nothing under this command's \"Only if changed\" paths.")
+                        .padding(.leading, 18)
                     }
                 }
             }
@@ -171,6 +181,11 @@ private struct ReviewView: View {
                                 .buttonStyle(.link)
                                 .font(.caption.monospaced())
                                 .help("Open in \(model.preferredEditor?.name ?? "editor")")
+                                .contextMenu {
+                                    if let worktree {
+                                        OtherEditorsMenuItems(file: URL(filePath: worktree).appending(path: finding.file), line: finding.line)
+                                    }
+                                }
                         }
                     }
                     MarkdownView(markdown: finding.detail).font(.callout)

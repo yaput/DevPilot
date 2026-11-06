@@ -22,6 +22,8 @@ public final class VerificationService: Sendable {
     private let validation: ValidationRunner
     private let artifacts: ArtifactStore
     private let qa: (any PipelineQA)?
+    /// Looks up a repository secret (repository ID, name), for the test database's connection.
+    private let secret: @Sendable (String, String) -> String?
 
     public init(
         database: AppDatabase,
@@ -31,9 +33,11 @@ public final class VerificationService: Sendable {
         validationTimeout: Duration,
         artifacts: ArtifactStore,
         buildGate: BuildGate? = nil,
-        qa: (any PipelineQA)? = nil
+        qa: (any PipelineQA)? = nil,
+        secret: @escaping @Sendable (String, String) -> String? = { _, _ in nil }
     ) {
         self.qa = qa
+        self.secret = secret
         self.database = database
         self.worktrees = worktrees
         self.runner = runner
@@ -181,26 +185,53 @@ public final class VerificationService: Sendable {
         let logDirectory = artifacts.runLogURL(ticketID: ticketID, kind: .validation, at: Date()).deletingPathExtension()
         let runID = try await database.beginVerificationRun(.validation, ticketID: ticketID, in: .validating, logPath: logDirectory.path)
         onEvent(.started)
+        var testDatabase: ValidationDatabase?
+        let adminPassword = repository.validationDatabase ? secret(repository.id, repository.localRun.database.passwordSecret) : nil
         do {
-            let result = try await validation.run(
-                commands: repository.validationCommands.filter(\.isEnabled).map(\.command),
+            let changedFiles = (try? await worktrees.changedFiles(in: workspace.worktreePath, since: workspace.baseCommit)) ?? []
+            let changedPaths = changedFiles.map(\.path)
+            let enabled = repository.validationCommands.filter(\.isEnabled)
+            let commands = enabled.filter { $0.applies(to: changedPaths) }.map(\.command)
+            let skipped = enabled.filter { !$0.applies(to: changedPaths) }
+            for rule in skipped {
+                onEvent(.progress("Skipped `\(rule.command)`: nothing changed under \(rule.onlyIfChanged)"))
+            }
+            var environment = CommandPresets.environment(fromLines: repository.validationEnvironment)
+                .merging(ValidationRunner.changeEnvironment(baseCommit: workspace.baseCommit, changedFiles: changedFiles)) { _, new in new }
+            if repository.validationDatabase, !commands.isEmpty {
+                onEvent(.progress("Creating a throwaway test database"))
+                let created = try await ValidationDatabase.create(
+                    ticketID: ticketID, config: repository.localRun.database, adminPassword: adminPassword, tools: tools
+                )
+                testDatabase = created
+                environment.merge(created.environment) { _, new in new }
+            }
+            let ran = try await validation.run(
+                commands: commands,
                 worktree: workspace.worktreePath,
                 commonGitDirectory: try await worktrees.commonGitDirectory(of: workspace.worktreePath),
                 tools: tools,
                 logDirectory: logDirectory,
                 fixAttempt: attempt,
-                environment: ValidationRunner.changeEnvironment(
-                    baseCommit: workspace.baseCommit, changedFiles: (try? await worktrees.changedFiles(in: workspace.worktreePath, since: workspace.baseCommit)) ?? []
-                ),
+                environment: environment,
                 onProgress: { onEvent(.progress($0)) },
                 onLaunch: { [database] group in Task { try? await database.recordProcessGroup(runID: runID, processGroup: group) } }
             )
+            await Self.drop(testDatabase, adminPassword: adminPassword, tools: tools)
+            let result = ValidationResult(commands: ran.commands, fixAttempt: ran.fixAttempt, skipped: skipped.map(\.command))
             try await database.completeValidation(runID: runID, ticketID: ticketID, result: result, thenReview: isFinal(result))
             return result
         } catch {
+            await Self.drop(testDatabase, adminPassword: adminPassword, tools: tools)
             await record(error, runID: runID, ticketID: ticketID)
             throw error
         }
+    }
+
+    /// In a fresh task, so it still runs when the validation was cancelled.
+    private static func drop(_ testDatabase: ValidationDatabase?, adminPassword: String?, tools: ToolEnvironment) async {
+        guard let testDatabase else { return }
+        await Task { await testDatabase.drop(adminPassword: adminPassword, tools: tools) }.value
     }
 
     private func review(
@@ -247,7 +278,7 @@ public final class VerificationService: Sendable {
               FileManager.default.fileExists(atPath: workspace.worktreePath) else {
             throw ImplementationError.worktreeMissing("the ticket's worktree")
         }
-        return workspace
+        return await worktrees.withCurrentBase(workspace)
     }
 
     /// The ticket stays where it rests (`validating` / `reviewing`) so the step can be re-run.

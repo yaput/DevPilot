@@ -729,7 +729,7 @@ public final class AppDatabase: Sendable {
             try Self.closeRun(db, runID: runID, outcome: .succeeded, stats: nil, message: nil)
             try db.execute(sql: "UPDATE agentRun SET reportJSON = ? WHERE id = ?", arguments: [try Self.json(result), runID])
             let failed = result.failed.count
-            let summary = result.commands.isEmpty ? "No validation commands configured"
+            let summary = result.commands.isEmpty ? (result.skipped.isEmpty ? "No validation commands configured" : "No validation command affected by the change")
                 : failed == 0 ? "All \(result.commands.count) validation command\(result.commands.count == 1 ? "" : "s") passed"
                 : "\(failed) of \(result.commands.count) validation command\(result.commands.count == 1 ? "" : "s") failed"
             try Self.insertEvent(db, ticketID: ticketID, kind: .transition, from: nil, to: nil, message: summary, at: Date())
